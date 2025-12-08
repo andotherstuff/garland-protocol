@@ -118,13 +118,14 @@ For a file of size S bytes, the number of blocks is:
 N_blocks = ⌈S / B⌉
 ```
 
-The final block is padded to exactly B bytes using a length-prefixed padding scheme. The first two bytes of each block encode the actual content length as a big-endian 16-bit unsigned integer, followed by the content bytes, followed by zero bytes to fill the block:
+The final block is padded to exactly B bytes using a length-prefixed padding scheme. Only the final block includes a length prefix: the first four bytes encode the actual content length as a big-endian 32-bit unsigned integer, followed by the content bytes, followed by zero bytes to fill the block:
 
 ```
-[content_length: u16_be][content: content_length bytes][padding: zeros]
+Non-final blocks: [content: B bytes]
+Final block:      [content_length: u32_be][content: content_length bytes][padding: zeros]
 ```
 
-This scheme enables unambiguous removal of padding during reconstruction. For the final block of a file, content_length contains `S mod B` (or B if S is an exact multiple). For non-final blocks, content_length equals B - 2, and the two-byte overhead slightly reduces effective capacity.
+This scheme enables unambiguous removal of padding during reconstruction. For the final block, content_length contains `S mod B` (or B if S is an exact multiple of B). Non-final blocks contain exactly B bytes of content with no overhead.
 
 ### 4.2 Privacy Through Uniformity
 
@@ -132,7 +133,19 @@ The decision to use fixed-size blocks with padding is primarily motivated by pri
 
 Without uniform sizing, an adversary observing uploads could distinguish small files from chunks of large files based on byte counts. They could infer file types from characteristic size patterns-a 4.7 GB blob likely represents a DVD image, while a 25 MB blob with specific dimensions suggests a high-resolution photograph. They could correlate related blobs by noticing that blobs uploaded together have sizes summing to a plausible file size. They could identify whether a blob contains user data or system metadata based on typical metadata sizes.
 
-With uniform blocks, all stored blobs appear identical in size. A 100-byte text file produces the same 256 KiB blob as a chunk of a multi-gigabyte video. Directory metadata, file inodes, and actual content are indistinguishable. The only information leaked is the count of blocks, which provides a loose upper bound on total data volume but reveals nothing about how that volume is distributed across files.
+With uniform blocks, all stored blobs appear identical in size. A 100-byte text file produces the same 256 KiB blob as a chunk of a multi-gigabyte video. Directory metadata, file inodes, and actual content are indistinguishable.
+
+The only information leaked is the count of blocks. An observer watching a specific server sees how many shares that server stores for a given user. Across all n servers, this reveals the total block count. From block count, an observer can infer:
+
+- **Total data volume**: block_count × block_size gives an upper bound on stored data
+- **Activity over time**: watching block count changes reveals when data is added or garbage collected
+- **Relative dataset size**: comparing users shows who stores more data
+
+However, block count does not reveal:
+- How many files exist (one file may span many blocks, many files may fit in one block)
+- File sizes (indistinguishable from padding)
+- Directory structure depth or breadth
+- What fraction is user data vs. metadata
 
 This uniformity has costs. Small files incur substantial padding overhead-a 1 KiB file stored in a 256 KiB block wastes 99.6% of the space, and after erasure coding with overhead factor 1.5x, that 1 KiB file consumes 384 KiB of storage across servers. This design accepts that tradeoff. Systems requiring efficient small-file storage should consider alternative approaches, but such optimizations necessarily leak information about file sizes.
 
@@ -162,21 +175,26 @@ where gf_log and gf_exp are 256-element lookup tables computed once at initializ
 
 ### 5.2 Encoding Process
 
-Encoding treats each byte position across the k source blocks as coefficients of a polynomial. For byte position i, let b₀, b₁, ..., b_{k-1} be the bytes at position i in each of the k source blocks. These define a polynomial:
+A single encrypted block of size B is encoded as follows:
+
+1. **Split**: Divide the block into k pieces, each of size B/k bytes
+2. **Encode**: Apply Reed-Solomon encoding to produce n shares, each of size B/k bytes
+3. **Distribute**: Upload each share to a different server
+
+For example, with (n=5, k=3) and B=256 KiB:
+- The 256 KiB block is split into 3 pieces of ~85 KiB each
+- These are encoded into 5 shares of ~85 KiB each
+- Total storage: 5 × 85 KiB ≈ 427 KiB (1.67× overhead)
+
+The encoding treats each byte position across the k pieces as coefficients of a polynomial. For byte position i, let b₀, b₁, ..., b_{k-1} be the bytes at position i in each piece. These define a polynomial:
 
 ```
 P(x) = b₀ + b₁x + b₂x² + ... + b_{k-1}x^{k-1}
 ```
 
-The n encoded shares contain the evaluations of P(x) at n distinct points. Using a systematic encoding where the first k shares contain the original data, the evaluation points are chosen such that P(αⁱ) for i = 0, 1, ..., k-1 reproduces the original bytes (α⁰ = 1, so P(1) = b₀ + b₁ + ... + b_{k-1} requires specific construction).
+The n shares contain the evaluations of P(x) at n distinct points. Using systematic encoding, the first k shares contain the original k pieces unchanged, followed by n - k parity shares.
 
-In practice, encoding multiplies the source vector by a k × n generator matrix GM derived from a Vandermonde matrix. The entry at row i, column j is α^{ij}. For systematic encoding, this matrix is transformed so that its first k columns form the identity matrix:
-
-```
-GM_systematic = V_{k,k}⁻¹ × V_{k,n}
-```
-
-The resulting encoded shares consist of the k original blocks (unchanged) followed by n - k parity blocks.
+In practice, encoding multiplies the source vector by a k × n generator matrix derived from a Vandermonde matrix. The computational cost is modest-encoding a 256 KiB block completes in milliseconds.
 
 ### 5.3 Decoding Process
 
@@ -198,7 +216,7 @@ The choice of n and k determines the tradeoff between storage overhead, fault to
 | 4 | 7 | 1.75× | 3 failures | 7 |
 | 6 | 9 | 1.50× | 3 failures | 9 |
 
-For personal storage, a (2, 3) or (3, 5) configuration provides a reasonable balance. The former tolerates one server failure with 50% overhead; the latter tolerates two failures with 67% overhead. Users with access to more servers or heightened durability requirements may choose higher parameters.
+For personal storage, an (n=3, k=2) or (n=5, k=3) configuration provides a reasonable balance. The former tolerates one server failure with 50% overhead; the latter tolerates two failures with 67% overhead. Users with access to more servers or heightened durability requirements may choose higher parameters.
 
 The system should store shares from the same block on distinct servers to maximize independence. If two shares land on the same server, that server's failure removes two shares rather than one, reducing effective fault tolerance.
 
@@ -225,6 +243,10 @@ nsec (Nostr secret key)
   │
   └─► Master Storage Key (derived via HKDF)
         │
+        ├─► Commit Key (derived, for encrypting commit events)
+        │
+        ├─► Metadata Key (derived, for encrypting inodes and directories)
+        │
         └─► Per-File Key (random, stored encrypted in inode)
               │
               └─► Per-Block Key (derived via HKDF from file key + block index)
@@ -243,7 +265,27 @@ master_key = HKDF-SHA256(
 
 This derivation is deterministic-the same nsec always produces the same master key-enabling recovery without storing additional secrets.
 
-Each file receives a randomly generated 256-bit key at creation time. This per-file key is stored within the file's inode, encrypted to the master key. Random per-file keys ensure that identical files produce different ciphertexts, preventing content-based correlation.
+Purpose-specific keys are derived from the master key:
+
+```
+commit_key = HKDF-SHA256(
+    IKM = master_key,
+    salt = "nostr-storage-v1",
+    info = "commit-encryption",
+    length = 32
+)
+
+metadata_key = HKDF-SHA256(
+    IKM = master_key,
+    salt = "nostr-storage-v1",
+    info = "metadata-encryption",
+    length = 32
+)
+```
+
+The commit key encrypts commit event content and sequence number tags. The metadata key encrypts inodes and directory blobs. Separating these keys limits the impact of potential key compromise and clarifies the encryption scope.
+
+Each file receives a randomly generated 256-bit key at creation time. This per-file key is stored within the file's inode, encrypted using XChaCha20-Poly1305 with the metadata key. Random per-file keys ensure that identical files produce different ciphertexts, preventing content-based correlation.
 
 Per-block keys are derived from the file key to avoid nonce reuse concerns:
 
@@ -279,11 +321,16 @@ The 24-byte nonce is prepended to the ciphertext so decryption can extract it. T
 
 ### 6.3 Metadata Encryption
 
-File inodes and directory entries contain sensitive metadata-filenames, sizes, timestamps, and structural relationships. This metadata receives the same encryption treatment as file content.
+File inodes and directory entries contain sensitive metadata-filenames, sizes, timestamps, and structural relationships. This metadata is encrypted using the metadata key derived from the master key.
 
-When storing an inode, the client serializes it to JSON, treats the JSON as file content, and processes it through the same block/encrypt/erasure-code pipeline. The resulting shares are indistinguishable from file data shares. Directory blobs undergo identical processing.
+When storing an inode or directory, the client:
+1. Serializes the structure to JSON
+2. Pads to the fixed block size (256 KiB)
+3. Encrypts using XChaCha20-Poly1305 with the metadata key
+4. Erasure-codes the encrypted block into n shares
+5. Uploads shares to n servers
 
-This recursive structure means servers observe only uniform encrypted blocks. They cannot determine whether a block contains a photograph, a text document, a directory listing, or another inode. The type and structure of stored data is completely opaque.
+The resulting shares are indistinguishable from file data shares. This recursive structure means servers observe only uniform encrypted blocks. They cannot determine whether a block contains a photograph, a text document, a directory listing, or another inode. The type and structure of stored data is completely opaque.
 
 ---
 
@@ -328,11 +375,11 @@ An inode contains all information necessary to reconstruct a file. After decrypt
 }
 ```
 
-The `key` field contains the per-file encryption key, itself encrypted using NIP-44 to the owner's public key. This double encryption-file content encrypted to the file key, file key encrypted to the owner key-enables potential future extensions where file keys could be shared with other parties without exposing the master key.
+The `key` field contains the per-file encryption key, encrypted using XChaCha20-Poly1305 with the metadata key. File content is encrypted to the file key, and the file key is encrypted to the metadata key. This hierarchy enables recovery from a single nsec while keeping file keys isolated.
 
 The `hash` field in each block entry contains the SHA-256 hash of the plaintext block before encryption. This enables integrity verification after decryption: if the decrypted block's hash doesn't match, either the ciphertext was corrupted, the wrong key was used, or the inode itself is corrupt.
 
-The `shares` array maps share indices to their content addresses and storage locations. During reconstruction, the client attempts to fetch shares in order, stopping once k shares are successfully retrieved.
+The `shares` array is ordered by share index (0 to n-1). The array position determines the share index, which is required for erasure decoding. During reconstruction, the client fetches shares from their listed servers, tracking which indices were successfully retrieved. Once k shares are obtained, decoding can proceed. Storing share indices in the inode (rather than embedding them in share data) provides better privacy-servers cannot determine a share's position in the erasure scheme.
 
 Inodes themselves are stored as blobs following the identical pipeline. An inode is serialized, padded, encrypted, erasure-coded, and distributed. The resulting structure is referenced by its content hash, forming a node in the Merkle DAG.
 
@@ -416,44 +463,33 @@ Each step requires fetching k shares, decoding, and decrypting. The total number
 
 ## 9. State Management via Hash Chain
 
-### 9.1 The Problem with Mutable Pointers
+### 9.1 Hash Chain of Commits
 
-A content-addressed storage system requires at least one mutable pointer to locate the current root. Without such a pointer, clients would need to know the root hash through some out-of-band mechanism, and that hash would change with every update.
-
-A naive approach uses a Nostr replaceable event (kinds 30000-39999) to store the current root hash. The most recent event for a given (kind, pubkey, d-tag) tuple supersedes all previous events. This works but has limitations.
-
-Replaceable events provide no history. Once superseded, the previous root is lost unless the client independently preserved it. There is no audit trail showing when changes occurred or what the previous states were. If two clients simultaneously commit changes, one will silently overwrite the other with no indication of conflict.
-
-Conflict detection is impossible. If device A commits while device B is offline, and then device B commits without fetching A's update, B's commit will reference an outdated parent state. With simple replaceable events, this produces silent data loss-A's changes vanish without warning.
-
-### 9.2 Hash Chain of Commits
-
-This design employs a hash chain of commit events rather than a single replaceable pointer. Each commit references its predecessor, forming a cryptographically-linked sequence analogous to a blockchain or git history.
+A content-addressed storage system requires a mutable pointer to locate the current root. This design uses a hash chain of commit events published as regular (non-replaceable) Nostr events. Each commit references its predecessor, forming a cryptographically-linked sequence analogous to a blockchain or git history. Using non-replaceable events ensures all commits persist on relays, enabling full history traversal and conflict detection.
 
 A commit event has the following structure:
 
 ```json
 {
-  "kind": 30097,
+  "kind": 10097,
   "pubkey": "<owner's public key>",
   "created_at": 1701907200,
   "tags": [
-    ["d", "storage-chain"],
     ["prev", "<event ID of previous commit>"],
-    ["root", "<content hash of root directory blob>"],
-    ["seq", "42"]
+    ["seq", "<encrypted sequence number>"]
   ],
-  "content": "<NIP-44 encrypted payload>",
+  "content": "<encrypted payload>",
   "sig": "<Schnorr signature>"
 }
 ```
 
-The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The `seq` tag provides a monotonically increasing sequence number for quick ordering. The `root` tag contains the content hash of the current root directory blob.
+The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The `seq` tag contains an encrypted sequence number for ordering (see Section 9.5 on metadata privacy). Kind 10097 is a regular (non-replaceable) event, ensuring all commits persist on relays.
 
-The encrypted `content` field contains additional metadata:
+The encrypted `content` field is encrypted using XChaCha20-Poly1305 with a key derived from the master storage key (see Section 6.1). It contains:
 
 ```json
 {
+  "seq": 42,
   "root_inode": {
     "hash": "<content hash of root directory inode>",
     "shares": [
@@ -468,9 +504,9 @@ The encrypted `content` field contains additional metadata:
 }
 ```
 
-The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted. The optional `message` field allows human-readable commit descriptions.
+The `seq` field is the plaintext sequence number (the tag contains it encrypted for ordering without decryption). The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted. The optional `message` field allows human-readable commit descriptions.
 
-### 9.3 Commit Process
+### 9.2 Commit Process
 
 Creating a new commit follows this sequence:
 
@@ -490,7 +526,7 @@ If step 2 reveals that the local state diverges from the chain head-because anot
 
 The appropriate strategy depends on the application. For personal backup, aborting with user notification is often sufficient. More sophisticated applications might implement git-like merging.
 
-### 9.4 Snapshot-Based Workflow
+### 9.3 Snapshot-Based Workflow
 
 The hash chain naturally supports an explicit save model rather than continuous synchronization. Users accumulate changes locally-adding files, modifying documents, reorganizing directories-without network activity. These changes exist only on the local device.
 
@@ -504,7 +540,7 @@ This batching reduces network traffic, avoids intermediate states, and gives use
 
 Between saves, the local state may be lost if the device fails. This is acceptable for a backup-oriented system-unsaved changes are analogous to unsaved edits in a document editor. Users who want continuous protection should save frequently.
 
-### 9.5 Chain Traversal and History
+### 9.4 Chain Traversal and History
 
 The complete history is recoverable by walking the chain backward from the head. Each commit's `prev` tag leads to its predecessor until reaching the genesis commit (which has no `prev` tag or a null value).
 
@@ -516,6 +552,21 @@ Clients can implement time-travel functionality: given any historical commit, th
 
 This history has storage implications. Old commits reference old blobs which must be retained for history to remain valid. Users who don't need history can garbage collect aggressively. Users who value history must retain more data. Section 13 discusses garbage collection in detail.
 
+### 9.5 Metadata Privacy
+
+Commit events are publicly visible on relays. To minimize metadata leakage, sensitive fields are encrypted:
+
+- **Sequence number**: The `seq` tag contains the sequence number encrypted with the master key. Clients can decrypt and sort locally. Observers see only opaque ciphertext and cannot determine commit frequency or total count.
+- **Root hash**: Stored only in the encrypted content, not as a plaintext tag. Observers cannot detect when the filesystem changes.
+- **Commit message**: Stored only in encrypted content.
+
+The only plaintext metadata exposed is:
+- The `prev` tag linking to the parent commit (necessary for chain traversal)
+- The `created_at` timestamp (required by Nostr protocol)
+- The owner's public key (inherent to Nostr signatures)
+
+The `prev` tag reveals the existence of a chain but not its contents. Timing analysis of `created_at` timestamps can reveal activity patterns; users concerned about this can batch commits or add random delays.
+
 ---
 
 ## 10. Single-Key Discovery and Recovery
@@ -525,13 +576,14 @@ This history has storage implications. Old commits reference old blobs which mus
 Disaster recovery requires only the owner's Nostr secret key (nsec). No backup files, no secondary credentials, no trusted third party. The recovery process:
 
 1. **Derive public key**: Compute npub from nsec using secp256k1
-2. **Query relays**: Request kind 30097 events with author = npub and d-tag = "storage-chain"
-3. **Find chain head**: Identify the event with highest sequence number (or most recent created_at)
+2. **Discover relays**: Query the user's relay list (NIP-65 outbox model) or use known relays
+3. **Query relays**: Request kind 10097 events with author = npub
 4. **Derive master key**: Compute master storage key from nsec via HKDF
-5. **Decrypt commit**: Decrypt the commit's content field using NIP-44
-6. **Fetch root**: Download k shares of the root directory inode using URLs from the commit
-7. **Decode and decrypt**: Erasure-decode and decrypt the root directory
-8. **Traverse**: Recursively fetch any desired files through the directory structure
+5. **Find chain head**: Decrypt the `seq` tag of each commit, identify the highest sequence number
+6. **Decrypt commit**: Decrypt the commit's content field using the master key
+7. **Fetch root**: Download k shares of the root directory inode using URLs from the commit
+8. **Decode and decrypt**: Erasure-decode and decrypt the root directory
+9. **Traverse**: Recursively fetch any desired files through the directory structure
 
 The Nostr relay network serves as the discovery layer. Relays are interchangeable-the client can query any relay that might have stored the owner's events. Since events are signed, their authenticity is verifiable regardless of which relay provides them.
 
@@ -653,10 +705,10 @@ The system's erasure coding distributes shares across servers, so migration requ
 The client periodically verifies that shares remain available. Several approaches exist:
 
 - **HEAD requests**: Query each server for share existence. Simple but reveals access patterns to servers.
-- **Range requests**: Request a byte range and verify its hash, sampling without downloading full shares.
+- **Range requests**: Request a byte range from the server and compare against the locally-stored share data. Since the client retains shares locally (or can reconstruct them from local file copies), it can verify server integrity without trusting precomputed hashes.
 - **Probabilistic filters**: Servers could publish bloom filters or similar structures enabling local existence checks without revealing queries. This would improve privacy but is not currently part of the Blossom specification.
 
-When verification detects missing shares, repair proceeds by fetching k surviving shares, reconstructing the block, re-encoding the missing share, and uploading to a replacement server. The inode and directory chain must then be updated to reflect the new share location.
+When verification detects missing or corrupted shares, repair proceeds by fetching k surviving shares, reconstructing the block, re-encoding the missing share, and uploading to a replacement server. The inode and directory chain must then be updated to reflect the new share location.
 
 ---
 
@@ -704,13 +756,16 @@ Several strategies for garbage collection exist, offering different tradeoffs:
 
 ### 13.4 Deletion Process
 
+To delete a garbage blob, all n shares must be deleted from their respective servers. Partial deletion leaves the blob reconstructable from surviving shares.
+
 To delete garbage blobs:
 
 1. Compute the set of blob hashes to delete
-2. For each hash and each server storing a share of that blob:
+2. For each blob, look up all n share locations from the inode
+3. For each share on each server:
    - Generate a deletion authorization event
    - Send DELETE request with authorization
-3. Update the garbage list in the next commit to reflect completed deletions
+4. Publish a commit with the `garbage` field listing the deleted blob hashes
 
 The commit's `garbage` field serves as an announcement of intent. It signals to future clients examining history that these blobs were deliberately deleted and should not be considered missing or corrupted.
 
@@ -851,7 +906,7 @@ Poly1305 authentication tags detect ciphertext tampering. Even if an attacker mo
 
 ### 15.3 Availability
 
-Erasure coding ensures availability despite server failures. With (k, n) parameters, data survives the loss of any n - k servers. The hash chain ensures commit history survives relay churn as long as at least one relay retains the events.
+Erasure coding ensures availability despite server failures. With (n, k) parameters, data survives the loss of any n - k servers. The hash chain ensures commit history survives relay churn as long as at least one relay retains the events.
 
 The system does not provide availability against censorship or targeted attacks where adversaries deliberately destroy more than n - k shares simultaneously.
 
@@ -952,7 +1007,7 @@ Significant work remains for production deployment. Payment integration, automat
 **Block size**: 256 KiB (262,144 bytes)  
 Provides good balance between padding overhead and chunking granularity.
 
-**Erasure coding**: (k=3, n=5)  
+**Erasure coding**: (n=5, k=3)
 Tolerates 2 server failures with 67% storage overhead. Requires 5 independent servers.
 
 **Encryption**: XChaCha20-Poly1305  
