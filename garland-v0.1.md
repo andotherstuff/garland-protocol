@@ -89,7 +89,7 @@ The system organizes functionality into distinct layers, each with a single resp
 │           (file metadata, block references)                 │
 ├─────────────────────────────────────────────────────────────┤
 │                  Encryption Layer                           │
-│        (per-block keys, authenticated encryption)           │
+│            (per-block keys, ChaCha20)                       │
 ├─────────────────────────────────────────────────────────────┤
 │                    Block Layer                              │
 │             (fixed-size, padded chunks)                     │
@@ -273,7 +273,7 @@ metadata_key = HKDF-SHA256(
 
 The commit key encrypts commit event content. The metadata key encrypts inodes and directory blobs. Separating these keys limits the impact of potential key compromise and clarifies the encryption scope.
 
-Each file receives a randomly generated 256-bit key at creation time. This per-file key is stored within the file's inode, encrypted using XChaCha20-Poly1305 with the metadata key. Random per-file keys ensure that identical files produce different ciphertexts, preventing content-based correlation.
+Each file receives a randomly generated 256-bit key at creation time. This per-file key is stored within the file's inode, encrypted with the metadata key. Random per-file keys ensure that identical files produce different ciphertexts, preventing content-based correlation.
 
 Per-block keys are derived from the file key to avoid nonce reuse concerns:
 
@@ -286,26 +286,22 @@ block_key = HKDF-SHA256(
 )
 ```
 
-### 6.2 Authenticated Encryption
+### 6.2 Encryption
 
-Each block is encrypted using XChaCha20-Poly1305, an authenticated encryption scheme providing both confidentiality and integrity. This algorithm was selected for several reasons.
-
-XChaCha20-Poly1305 uses a 192-bit nonce, large enough that random generation is safe without coordination. The probability of nonce collision reaches 50% only after approximately 2^96 encryptions with the same key-far beyond any realistic usage. This property simplifies implementation since blocks can use random nonces without tracking which nonces have been used.
-
-The algorithm performs well in software without hardware acceleration. On systems lacking AES-NI instructions, ChaCha20 outperforms AES by a factor of three or more. Since storage systems may run on diverse hardware including mobile devices and low-power servers, software performance matters.
-
-Poly1305 authentication detects any modification to the ciphertext. An attacker who alters even a single bit will cause decryption to fail with overwhelming probability. This integrity protection operates independently of the content-addressing scheme and provides defense in depth.
+Each block is encrypted using ChaCha20, a stream cipher widely used in the Nostr ecosystem (NIP-44) and well-supported across platforms.
 
 The encryption process for block i with file key K_f:
 
 ```
 block_key = HKDF-SHA256(K_f, "block-encryption", i, 32)
-nonce = random_bytes(24)
-ciphertext = XChaCha20-Poly1305-Encrypt(block_key, nonce, plaintext_block)
+nonce = random_bytes(12)
+ciphertext = ChaCha20-Encrypt(block_key, nonce, plaintext_block)
 encrypted_block = nonce || ciphertext
 ```
 
-The 24-byte nonce is prepended to the ciphertext so decryption can extract it. The authentication tag (16 bytes) is appended by the AEAD construction. Total overhead per block is 40 bytes (24-byte nonce + 16-byte tag), negligible relative to the 256 KiB block size.
+The 12-byte nonce is prepended to the ciphertext. Total overhead per block is 12 bytes, negligible relative to the 256 KiB block size.
+
+Integrity is provided by the content-addressing scheme. Each share is stored and retrieved by its SHA-256 hash—if a server returns data that doesn't match the requested hash, it is rejected. After decryption, the plaintext block hash is verified against the value stored in the inode. This layered integrity checking at the storage layer makes encryption-layer authentication unnecessary.
 
 ### 6.3 Metadata Encryption
 
@@ -314,7 +310,7 @@ File inodes and directory entries contain sensitive metadata-filenames, sizes, t
 When storing an inode or directory, the client:
 1. Serializes the structure to JSON
 2. Pads to the fixed block size (256 KiB)
-3. Encrypts using XChaCha20-Poly1305 with the metadata key
+3. Encrypts using ChaCha20 with the metadata key
 4. Erasure-codes the encrypted block into n shares
 5. Uploads shares to n servers
 
@@ -363,7 +359,7 @@ An inode contains all information necessary to reconstruct a file. After decrypt
 }
 ```
 
-The `key` field contains the per-file encryption key, encrypted using XChaCha20-Poly1305 with the metadata key. File content is encrypted to the file key, and the file key is encrypted to the metadata key. This hierarchy enables recovery from a single nsec while keeping file keys isolated.
+The `key` field contains the per-file encryption key, encrypted with the metadata key. File content is encrypted to the file key, and the file key is encrypted to the metadata key. This hierarchy enables recovery from a single nsec while keeping file keys isolated.
 
 The `hash` field in each block entry contains the SHA-256 hash of the plaintext block before encryption. This enables integrity verification after decryption: if the decrypted block's hash doesn't match, either the ciphertext was corrupted, the wrong key was used, or the inode itself is corrupt.
 
@@ -494,7 +490,7 @@ A commit event has the following structure:
 
 The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The genesis commit omits this tag. The `created_at` timestamp provides temporal ordering; Nostr relays serve events in reverse chronological order by default, enabling efficient head discovery (see Section 9.5).
 
-The encrypted `content` field is encrypted using XChaCha20-Poly1305 with a key derived from the master storage key (see Section 6.1). It contains:
+The encrypted `content` field is encrypted using ChaCha20 with the commit key derived from the master storage key (see Section 6.1). It contains:
 
 ```json
 {
@@ -1235,7 +1231,7 @@ To add a file to the storage system:
 3. Generate a random per-file encryption key
 4. For each block:
    - Derive the block encryption key
-   - Encrypt with XChaCha20-Poly1305
+   - Encrypt with ChaCha20
    - Erasure-code into n shares
    - Upload shares to n servers
 5. Construct the inode with block metadata
@@ -1304,7 +1300,7 @@ When storage costs warrant cleanup:
 
 Storage servers observe only uniformly-sized encrypted blobs. They cannot determine:
 
-- File contents (encrypted with XChaCha20-Poly1305)
+- File contents (encrypted with ChaCha20)
 - File sizes (obscured by fixed block padding)
 - File types (all blocks are indistinguishable)
 - Filenames (stored in encrypted directory blobs)
@@ -1317,7 +1313,7 @@ The encryption is semantic-identical plaintexts produce different ciphertexts du
 
 Content addressing provides integrity at multiple levels. Share hashes verify individual share integrity. Block hashes (stored in inodes) verify decrypted block integrity. The Merkle DAG structure verifies structural integrity-any modification to any blob changes the root hash.
 
-Poly1305 authentication tags detect ciphertext tampering. Even if an attacker modifies stored ciphertext in a way that produces a valid hash, decryption will fail authentication.
+Content addressing detects ciphertext tampering. If an attacker modifies stored data, the SHA-256 hash will not match the share ID, and the data will be rejected before decryption is attempted.
 
 ### 17.3 Availability
 
@@ -1374,7 +1370,7 @@ More sophisticated cryptographic proofs could enable efficient verification with
 
 ## 19. Conclusion
 
-This design provides a practical architecture for durable, private, personal storage built on existing Nostr and Blossom infrastructure. The layered architecture separates concerns: fixed-size blocks provide privacy through uniformity, erasure coding provides durability through redundancy, authenticated encryption provides confidentiality and integrity, the Merkle DAG provides efficient updates and verification, and the hash chain provides auditable history with conflict detection.
+This design provides a practical architecture for durable, private, personal storage built on existing Nostr and Blossom infrastructure. The layered architecture separates concerns: fixed-size blocks provide privacy through uniformity, erasure coding provides durability through redundancy, encryption provides confidentiality, content addressing provides integrity, the Merkle DAG provides efficient updates and verification, and the hash chain provides auditable history with conflict detection.
 
 The system achieves its core requirements. Durability is provided through erasure coding-data survives arbitrary server failures up to the configured threshold. Privacy is comprehensive-storage providers learn nothing about content, sizes, structure, or access patterns beyond gross storage volume. Sovereignty is preserved-users control when changes commit and when old data is deleted. Recoverability is complete-the entire dataset and its history can be reconstructed from a single secret key.
 
@@ -1398,17 +1394,15 @@ Significant work remains for production deployment. Payment integration, automat
 
 6. IETF RFC 8439. ChaCha20 and Poly1305 for IETF Protocols. https://tools.ietf.org/html/rfc8439
 
-7. IETF. XChaCha: eXtended-nonce ChaCha and AEAD_XChaCha20_Poly1305. https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha-03
+7. IETF RFC 5869. HMAC-based Extract-and-Expand Key Derivation Function (HKDF). https://tools.ietf.org/html/rfc5869
 
-8. IETF RFC 5869. HMAC-based Extract-and-Expand Key Derivation Function (HKDF). https://tools.ietf.org/html/rfc5869
+8. IETF RFC 5510. Reed-Solomon Forward Error Correction (FEC) Schemes. https://tools.ietf.org/html/rfc5510
 
-9. IETF RFC 5510. Reed-Solomon Forward Error Correction (FEC) Schemes. https://tools.ietf.org/html/rfc5510
+9. BIP-340. Schnorr Signatures for secp256k1. https://bips.dev/340/
 
-10. BIP-340. Schnorr Signatures for secp256k1. https://bips.dev/340/
+10. IETF RFC 2898. PKCS #5: Password-Based Cryptography Specification Version 2.0. https://tools.ietf.org/html/rfc2898
 
-11. IETF RFC 2898. PKCS #5: Password-Based Cryptography Specification Version 2.0. https://tools.ietf.org/html/rfc2898
-
-12. BIP-39. Mnemonic code for generating deterministic keys. https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+11. BIP-39. Mnemonic code for generating deterministic keys. https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
 
 ---
 
@@ -1418,7 +1412,7 @@ Significant work remains for production deployment. Payment integration, automat
 |-----------|-------|-----------|
 | Block size | 256 KiB | Balance between padding overhead and chunking granularity |
 | Erasure coding | (n=5, k=3) | Tolerates 2 failures with 67% overhead |
-| Encryption | XChaCha20-Poly1305 | Safe random nonces, excellent software performance |
+| Encryption | ChaCha20 | Simple, fast, integrity via content addressing |
 | Key derivation | HKDF-SHA256 | Standard, widely implemented |
 | Commit relays | 5+ | Ensures retrievability despite relay failures |
 | Verification | Weekly | Balances failure detection and bandwidth |

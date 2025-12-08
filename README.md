@@ -17,7 +17,7 @@ Garland is a distributed storage system that lets you back up personal data acro
 
 Files are chunked into fixed-size blocks, encrypted, erasure-coded into shares, and distributed across Blossom servers. A hierarchical namespace (like a filesystem) is maintained via content-addressed manifests stored the same way. The root pointer lives on Nostr relays as a signed event.
 
-See [v0](v0/) and [v0.1](v0.1/) for the design documents.
+See [garland-v0.md](garland-v0.md) and [garland-v0.1.md](garland-v0.1.md) for the design documents.
 
 ## Changelog: v0 → v0.1
 
@@ -35,7 +35,7 @@ See [v0](v0/) and [v0.1](v0.1/) for the design documents.
 
 **Verification and Repair**
 - *v0:* Dedicated steward service running independently with owner's nsec; verifies via range requests
-- *v0.1:* Client verifies via HEAD requests, range requests, or potential future filters; steward deferred to future work
+- *v0.1:* Multiple verification approaches (HEAD requests, byte range verification, fuse filters) with tradeoff analysis; detailed steward service model with authority levels (full, repair-only, read-only); explicit repair flow
 
 **Update Model**
 - *v0:* Implicit copy-on-write with unspecified commit timing
@@ -52,6 +52,18 @@ See [v0](v0/) and [v0.1](v0.1/) for the design documents.
 **Large File Handling**
 - *v0:* Inode size unbounded — large files could exceed block limits
 - *v0.1:* Indirect block structure for files exceeding ~500 blocks; bounds inode size regardless of file size
+
+**Commit Ordering**
+- *v0:* Replaceable event with implicit ordering
+- *v0.1:* No sequence counter; head discovery via `limit=1` relay query (reverse chronological); chain traversal via `prev` tags for full history
+
+**Encryption**
+- *v0:* ChaCha20-Poly1305 or AES-GCM (underspecified)
+- *v0.1:* ChaCha20 with 12-byte nonce; integrity via content addressing (SHA-256 share IDs + plaintext block hashes in inodes)
+
+**Privacy Analysis**
+- *v0:* Section on "What Servers Observe"
+- *v0.1:* Expanded to dedicated section covering Blossom servers, Nostr relays, cross-server correlation, and information leak summary with mitigations
 
 ## Status
 
