@@ -198,13 +198,16 @@ The choice of n and k determines the tradeoff between storage overhead, fault to
 
 | k | n | Overhead | Tolerance | Servers Required |
 |---|---|----------|-----------|------------------|
+| 1 | 3 | 3.00× | 2 failures | 3 |
 | 2 | 3 | 1.50× | 1 failure | 3 |
 | 3 | 5 | 1.67× | 2 failures | 5 |
 | 4 | 6 | 1.50× | 2 failures | 6 |
 | 4 | 7 | 1.75× | 3 failures | 7 |
 | 6 | 9 | 1.50× | 3 failures | 9 |
 
-For personal storage, an (n=3, k=2) or (n=5, k=3) configuration provides a reasonable balance. The former tolerates one server failure with 50% overhead; the latter tolerates two failures with 67% overhead. Users with access to more servers or heightened durability requirements may choose higher parameters.
+**Simple replication (k=1)**: When k=1, erasure coding degenerates to simple replication—each share is an identical copy of the full encrypted block. Any single server can provide the complete block with no decoding required. This configuration trades storage efficiency (n× overhead) for operational simplicity and maximum fault tolerance (survives n−1 failures). It suits users who prioritize simplicity over storage cost, or who have access to few servers. Note that with k=1, all servers store blobs with identical hashes, enabling potential cross-server correlation; with k>1, each share has a unique hash.
+
+**Erasure coding (k>1)**: For personal storage, (n=3, k=2) or (n=5, k=3) provides a reasonable balance. The former tolerates one server failure with 50% overhead; the latter tolerates two failures with 67% overhead. Users with access to more servers or heightened durability requirements may choose higher parameters.
 
 The system should store shares from the same block on distinct servers to maximize independence. If two shares land on the same server, that server's failure removes two shares rather than one, reducing effective fault tolerance.
 

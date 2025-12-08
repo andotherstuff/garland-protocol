@@ -8,7 +8,7 @@ Garland is a distributed storage system that lets you back up personal data acro
 
 **Core properties:**
 
-- **Durable** — Erasure coding (n, k) means data survives arbitrary server failures
+- **Durable** — Erasure coding or simple replication across n servers; survives arbitrary server failures
 - **Private** — Servers see only fixed-size encrypted blobs; they learn nothing about content, filenames, or structure
 - **Recoverable** — Everything reconstructable from your Nostr key (nsec)
 - **Simple** — Storage servers stay "dumb"—just PUT and GET opaque blobs
@@ -60,6 +60,10 @@ See [garland-v0.md](garland-v0.md) and [garland-v0.1.md](garland-v0.1.md) for th
 **Encryption**
 - *v0:* ChaCha20-Poly1305 or AES-GCM (underspecified)
 - *v0.1:* ChaCha20 with 12-byte nonce; integrity via content addressing (SHA-256 share IDs + plaintext block hashes in inodes)
+
+**Erasure Coding**
+- *v0:* Required; parameters unspecified
+- *v0.1:* Optional; k=1 enables simple replication (n identical copies, no encoding), k>1 enables erasure coding; parameter table with overhead/tolerance tradeoffs
 
 **Privacy Analysis**
 - *v0:* Section on "What Servers Observe"
