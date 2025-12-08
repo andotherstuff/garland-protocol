@@ -156,23 +156,9 @@ This uniformity has costs. Small files incur substantial padding overhead-a 1 Ki
 
 ### 5.1 Reed-Solomon Coding
 
-Each encrypted block undergoes erasure coding to provide redundancy across multiple storage servers. The system employs Reed-Solomon codes, which belong to the family of Maximum Distance Separable (MDS) codes-they achieve the theoretical optimum for storage efficiency at any given fault tolerance level.
+Each encrypted block undergoes erasure coding to provide redundancy across multiple storage servers. The system employs Reed-Solomon codes over GF(2^8), which are Maximum Distance Separable (MDS)—achieving optimal storage efficiency for any fault tolerance level.
 
-A Reed-Solomon (n, k) code transforms k source symbols into n encoded symbols such that any k of the n symbols suffice to reconstruct the original data. The system can tolerate the loss of any n - k symbols, whether from server failures, network partitions, or data corruption.
-
-The mathematical foundation rests on arithmetic in a Galois Field. This implementation uses GF(2^8), the field with 256 elements corresponding to byte values 0-255. Field elements are represented as polynomials over GF(2) with degree less than 8, and the field is constructed using the irreducible polynomial:
-
-```
-p(x) = x⁸ + x⁴ + x³ + x² + 1
-```
-
-Addition in GF(2^8) is simply XOR of byte values. Multiplication is more complex but can be implemented efficiently using precomputed logarithm tables. For elements a and b with a,b ≠ 0:
-
-```
-a × b = gf_exp[(gf_log[a] + gf_log[b]) mod 255]
-```
-
-where gf_log and gf_exp are 256-element lookup tables computed once at initialization using a generator element (typically α = 2).
+A Reed-Solomon (n, k) code transforms k source symbols into n encoded symbols such that any k of the n symbols suffice to reconstruct the original data. The system tolerates the loss of any n - k symbols from server failures, network partitions, or data corruption.
 
 ### 5.2 Encoding Process
 
@@ -384,6 +370,28 @@ The `shares` array is ordered by share index (0 to n-1). The array position dete
 
 Inodes themselves are stored as blobs following the identical pipeline. An inode is serialized, padded, encrypted, erasure-coded, and distributed. The resulting structure is referenced by its content hash, forming a node in the Merkle DAG.
 
+### 7.1 Large File Inodes
+
+Files with many blocks may produce inodes exceeding the standard block size. With (n=5, k=3) erasure coding, each block entry requires approximately 500 bytes for share IDs and server URLs. A file with 500,000 blocks would generate a ~250 MB inode—far exceeding the 256 KiB block limit.
+
+For files exceeding approximately 500 blocks, the inode uses an indirect block structure:
+
+```json
+{
+  "version": 1,
+  "type": "file",
+  "size": 137438953472,
+  "indirect": true,
+  "block_index": [
+    {"hash": "<content hash of block index chunk 0>", "shares": [...]},
+    {"hash": "<content hash of block index chunk 1>", "shares": [...]}
+  ],
+  "erasure": {"algorithm": "reed-solomon", "k": 2, "n": 3}
+}
+```
+
+Each block index chunk contains an array of block entries, stored as a separate encrypted blob. This bounds inode size regardless of file size, at the cost of one additional fetch per block index chunk during file access.
+
 ---
 
 ## 8. Directory Hierarchy
@@ -472,7 +480,7 @@ A commit event has the following structure:
 
 ```json
 {
-  "kind": 10097,
+  "kind": 1097,
   "pubkey": "<owner's public key>",
   "created_at": 1701907200,
   "tags": [
@@ -484,7 +492,7 @@ A commit event has the following structure:
 }
 ```
 
-The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The `seq` tag contains an encrypted sequence number for ordering (see Section 9.5 on metadata privacy). Kind 10097 is a regular (non-replaceable) event, ensuring all commits persist on relays.
+The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The `seq` tag contains an encrypted sequence number for ordering (see Section 9.5 on metadata privacy).
 
 The encrypted `content` field is encrypted using XChaCha20-Poly1305 with a key derived from the master storage key (see Section 6.1). It contains:
 
@@ -543,7 +551,7 @@ Between saves, the local state may be lost if the device fails. This is acceptab
 
 ### 9.4 Chain Traversal and History
 
-The complete history is recoverable by walking the chain backward from the head. Each commit's `prev` tag leads to its predecessor until reaching the genesis commit (which has no `prev` tag or a null value).
+The complete history is recoverable by walking the chain backward from the head. Each commit's `prev` tag leads to its predecessor until reaching the genesis commit, which omits the `prev` tag entirely.
 
 ```
 HEAD ──prev──► Commit N-1 ──prev──► Commit N-2 ──prev──► ... ──prev──► Genesis
@@ -551,7 +559,7 @@ HEAD ──prev──► Commit N-1 ──prev──► Commit N-2 ──prev─
 
 Clients can implement time-travel functionality: given any historical commit, they can reconstruct the exact filesystem state at that point by using the commit's root hash to traverse the Merkle DAG.
 
-This history has storage implications. Old commits reference old blobs which must be retained for history to remain valid. Users who don't need history can garbage collect aggressively. Users who value history must retain more data. Section 13 discusses garbage collection in detail.
+This history has storage implications. Old commits reference old blobs which must be retained for history to remain valid. Users who don't need history can garbage collect aggressively. Users who value history must retain more data. Section 14 discusses garbage collection in detail.
 
 ### 9.5 Metadata Privacy
 
@@ -578,7 +586,7 @@ Disaster recovery requires only the owner's Nostr secret key (nsec). No backup f
 
 1. **Derive public key**: Compute npub from nsec using secp256k1
 2. **Discover relays**: Query the user's relay list (NIP-65 outbox model) or use known relays
-3. **Query relays**: Request kind 10097 events with author = npub
+3. **Query relays**: Request kind 1097 events with author = npub
 4. **Derive master key**: Compute master storage key from nsec via HKDF
 5. **Find chain head**: Decrypt the `seq` tag of each commit, identify the highest sequence number
 6. **Decrypt commit**: Decrypt the commit's content field using the master key
@@ -722,55 +730,19 @@ This enables compartmentalized storage where compromise of one passphrase does n
 
 ### 11.7 Security Analysis
 
-**Threat: Attacker obtains nsec only**
+With nsec alone, an attacker can access the empty-passphrase bucket but cannot determine if other buckets exist. Finding additional buckets requires brute-forcing passphrases through PBKDF2 (210,000 iterations per guess). At ~10,000 GPU guesses/second, a passphrase with 80+ bits of entropy remains computationally infeasible to crack.
 
-The attacker can compute the empty-passphrase storage identity and access that bucket. They cannot determine whether other passphrases exist. To find additional buckets, they must:
+Under duress, revealing a decoy passphrase provides plausible deniability—there is no cryptographic evidence that other buckets exist. Weak passphrases remain vulnerable to dictionary attacks; high-security buckets require strong passphrases.
 
-1. Guess candidate passphrases
-2. Run PBKDF2 (210,000 iterations) for each guess
-3. Derive the candidate npub
-4. Query relays for commits from that npub
-5. Repeat until a bucket is found or guesses are exhausted
+Side-channel correlation (timing, IP addresses, relay patterns) can link derived identities. Users requiring strong compartmentalization should access different buckets through different network paths.
 
-At 210,000 PBKDF2-HMAC-SHA256 iterations, a single CPU core achieves roughly 5-10 guesses per second. A GPU can parallelize this to perhaps 10,000 guesses per second. For a passphrase with 40 bits of entropy (e.g., four random words), exhaustive search requires approximately 2⁴⁰ / 10,000 / 86,400 ≈ 1,200 days of GPU time.
+### 11.8 Design Rationale
 
-**Threat: Attacker demands passphrase under duress**
+The derived-identity approach was chosen over alternatives:
 
-The user reveals the empty passphrase (or a decoy passphrase). The attacker obtains access to the corresponding bucket. There is no cryptographic evidence that other buckets exist—each passphrase produces an independent, valid-looking identity. The attacker cannot prove the user is withholding additional passphrases.
-
-**Threat: Weak passphrase**
-
-If the user chooses a weak passphrase like "letmein", it will be found quickly through dictionary attack. This is inherent to any passphrase-based system. Users should be advised to choose strong passphrases for high-security buckets. The empty-passphrase bucket should contain only non-sensitive or decoy data.
-
-**Threat: Side-channel observation**
-
-An attacker who observes multiple derived npubs over time might correlate them through timing analysis, IP addresses, or relay access patterns. The cryptographic derivation provides no protection against operational security failures. Users requiring strong compartmentalization should access different buckets through different network paths.
-
-### 11.8 Comparison with Alternative Approaches
-
-Several alternative designs were considered:
-
-**Passphrase in key hierarchy (not identity derivation)**
-
-An alternative approach derives the master storage key from nsec + passphrase but keeps the same npub for signing. This allows changing passphrases by re-encrypting file keys rather than re-publishing all commits.
-
-| Property | Derived Identity (this design) | Key Hierarchy Only |
-|----------|-------------------------------|-------------------|
-| Protocol changes | None | Modify key derivation |
-| Identity separation | Full (different npub) | None (same npub) |
-| Passphrase change | Re-publish all commits | Re-encrypt file keys |
-| Plausible deniability | Strong | Weak (commits visible) |
-| Data discoverability | Cannot find without passphrase | Can find, cannot decrypt |
-
-The derived identity approach was chosen for its stronger deniability and zero protocol changes.
-
-**Memory-hard KDF (Argon2)**
-
-Argon2 provides stronger resistance to GPU/ASIC attacks through memory-hardness. However, it introduces BLAKE2b, a primitive not used elsewhere in Nostr. The marginal security benefit was judged insufficient to justify the additional cryptographic dependency.
-
-**Higher PBKDF2 iterations**
-
-Iterations could be increased beyond 210,000 at the cost of slower derivation. The current value aligns with OWASP 2023 recommendations for PBKDF2-HMAC-SHA256 and provides a reasonable balance between security and usability. Implementations may offer configurable iteration counts for users with specific requirements.
+- **Key-hierarchy-only** (same npub, different encryption keys): Weaker deniability since commits remain discoverable; requires protocol changes.
+- **Argon2**: Stronger GPU resistance but introduces BLAKE2b, a primitive not used elsewhere in Nostr.
+- **Higher iterations**: Possible but trades usability; 210,000 aligns with OWASP 2023 recommendations.
 
 ### 11.9 Implementation Notes
 
@@ -789,7 +761,7 @@ The recovery process (Section 10.1) is modified as follows:
 1. **Obtain credentials**: User provides nsec and passphrase (empty string if none)
 2. **Derive storage nsec**: Apply the derivation function from Section 11.4
 3. **Derive storage npub**: Compute public key from derived nsec
-4. **Query relays**: Request kind 10097 events with author = storage npub
+4. **Query relays**: Request kind 1097 events with author = storage npub
 5. **Continue as normal**: Decrypt commits, fetch root, traverse structure
 
 The only change is steps 1-3: deriving the storage identity before querying relays. All subsequent operations are identical to the base protocol.
@@ -962,7 +934,7 @@ To delete garbage blobs:
    - Send DELETE request with authorization
 4. Publish a commit with the `garbage` field listing the deleted blob hashes
 
-The commit's `garbage` field serves as an announcement of intent. It signals to future clients examining history that these blobs were deliberately deleted and should not be considered missing or corrupted.
+The commit's `garbage` field serves as an announcement of intent. It signals to future clients examining history that these blobs were deliberately deleted and should not be considered missing or corrupted. Note that these hashes, while encrypted within the commit, could theoretically be correlated by an adversary who previously observed blob uploads—though this requires both passive observation of uploads and access to decrypted commits.
 
 Deletion authorization uses the same Nostr event mechanism as uploads:
 
@@ -1168,59 +1140,38 @@ Significant work remains for production deployment. Payment integration, automat
 
 1. Nostr Protocol. NIP-01: Basic Protocol Flow Description. https://github.com/nostr-protocol/nips/blob/master/01.md
 
-2. Blossom Protocol. BUD-01: Server Specification. https://github.com/hzrd149/blossom
+2. Nostr Protocol. NIP-44: Encrypted Payloads (Versioned). https://github.com/nostr-protocol/nips/blob/master/44.md
 
-3. IETF RFC 8439. ChaCha20 and Poly1305 for IETF Protocols. https://tools.ietf.org/html/rfc8439
+3. Nostr Protocol. NIP-65: Relay List Metadata. https://github.com/nostr-protocol/nips/blob/master/65.md
 
-4. IETF RFC 5869. HMAC-based Extract-and-Expand Key Derivation Function (HKDF). https://tools.ietf.org/html/rfc5869
+4. Blossom Protocol. BUD-01: Server Specification. https://github.com/hzrd149/blossom
 
-5. IETF RFC 5510. Reed-Solomon Forward Error Correction (FEC) Schemes. https://tools.ietf.org/html/rfc5510
+5. Nostr Protocol. NIP-B7: Blossom. https://github.com/nostr-protocol/nips/blob/master/B7.md
 
-6. BIP-340. Schnorr Signatures for secp256k1. https://bips.dev/340/
+6. IETF RFC 8439. ChaCha20 and Poly1305 for IETF Protocols. https://tools.ietf.org/html/rfc8439
 
-7. Nostr Protocol. NIP-44: Encrypted Payloads (Versioned). https://github.com/nostr-protocol/nips/blob/master/44.md
+7. IETF. XChaCha: eXtended-nonce ChaCha and AEAD_XChaCha20_Poly1305. https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha-03
 
-8. IETF RFC 2898. PKCS #5: Password-Based Cryptography Specification Version 2.0. https://tools.ietf.org/html/rfc2898
+8. IETF RFC 5869. HMAC-based Extract-and-Expand Key Derivation Function (HKDF). https://tools.ietf.org/html/rfc5869
 
-9. BIP-39. Mnemonic code for generating deterministic keys. https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+9. IETF RFC 5510. Reed-Solomon Forward Error Correction (FEC) Schemes. https://tools.ietf.org/html/rfc5510
+
+10. BIP-340. Schnorr Signatures for secp256k1. https://bips.dev/340/
+
+11. IETF RFC 2898. PKCS #5: Password-Based Cryptography Specification Version 2.0. https://tools.ietf.org/html/rfc2898
+
+12. BIP-39. Mnemonic code for generating deterministic keys. https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
 
 ---
 
-## Appendix A: Notation Reference
+## Appendix: Recommended Parameters
 
-| Symbol | Meaning |
-|--------|---------|
-| B | Block size in bytes (typically 262,144) |
-| k | Erasure coding: minimum shares for reconstruction |
-| n | Erasure coding: total shares per block |
-| nsec | Nostr secret key (32 bytes) |
-| npub | Nostr public key (32-byte x-coordinate) |
-| GF(2^8) | Galois Field with 256 elements |
-| H(x) | SHA-256 hash function |
-| HKDF | HMAC-based Key Derivation Function |
-| PBKDF2 | Passphrase-stretching Key Derivation Function (RFC 2898) |
-| XChaCha20 | Extended-nonce ChaCha20 stream cipher |
-| Poly1305 | One-time authenticator MAC |
-
-## Appendix B: Recommended Parameters
-
-**Block size**: 256 KiB (262,144 bytes)  
-Provides good balance between padding overhead and chunking granularity.
-
-**Erasure coding**: (n=5, k=3)
-Tolerates 2 server failures with 67% storage overhead. Requires 5 independent servers.
-
-**Encryption**: XChaCha20-Poly1305  
-192-bit nonces enable safe random generation. Software performance excellent without hardware acceleration.
-
-**Key derivation**: HKDF-SHA256  
-Standard, well-analyzed, widely implemented.
-
-**Commit distribution**: 5+ Nostr relays  
-Ensures commit retrievability despite relay failures.
-
-**Verification interval**: Weekly
-Balance between catching failures early and minimizing bandwidth.
-
-**Passphrase derivation**: PBKDF2-HMAC-SHA256, 210,000 iterations
-Based on OWASP 2023 recommendations. Provides ~0.5-1 second derivation time on typical hardware while resisting offline attacks.
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Block size | 256 KiB | Balance between padding overhead and chunking granularity |
+| Erasure coding | (n=5, k=3) | Tolerates 2 failures with 67% overhead |
+| Encryption | XChaCha20-Poly1305 | Safe random nonces, excellent software performance |
+| Key derivation | HKDF-SHA256 | Standard, widely implemented |
+| Commit relays | 5+ | Ensures retrievability despite relay failures |
+| Verification | Weekly | Balances failure detection and bandwidth |
+| Passphrase KDF | PBKDF2, 210k iterations | OWASP 2023 aligned, ~0.5-1s derivation |
