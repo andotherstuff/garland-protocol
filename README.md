@@ -34,12 +34,8 @@ See [v0](v0/) and [v0.1](v0.1/) for the design documents.
 - *v0.1:* Explicit client responsibility with reference tracking, deletion strategies, and `garbage` field in commits announcing deleted blobs
 
 **Verification and Repair**
-- *v0:* Dedicated steward service running independently with owner's nsec or delegated key
-- *v0.1:* Client performs periodic verification and repair; steward deferred to future work
-
-**Existence Queries**
-- *v0:* Not addressed
-- *v0.1:* Binary fuse filters published by servers enable privacy-preserving local membership checks without revealing query patterns
+- *v0:* Dedicated steward service running independently with owner's nsec; verifies via range requests
+- *v0.1:* Client verifies via HEAD requests, range requests, or potential future filters; steward deferred to future work
 
 **Update Model**
 - *v0:* Implicit copy-on-write with unspecified commit timing

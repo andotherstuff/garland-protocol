@@ -26,7 +26,7 @@ This document describes a distributed storage system built upon Nostr and Blosso
 9. [State Management via Hash Chain](#9-state-management-via-hash-chain)
 10. [Single-Key Discovery and Recovery](#10-single-key-discovery-and-recovery)
 11. [Transport Layer](#11-transport-layer)
-12. [Privacy-Preserving Existence Queries](#12-privacy-preserving-existence-queries)
+12. [Verification and Availability Checks](#12-verification-and-availability-checks)
 13. [Garbage Collection](#13-garbage-collection)
 14. [Lifecycle Summary](#14-lifecycle-summary)
 15. [Security Analysis](#15-security-analysis)
@@ -648,54 +648,15 @@ The system's erasure coding distributes shares across servers, so migration requ
 
 ---
 
-## 12. Privacy-Preserving Existence Queries
+## 12. Verification and Availability Checks
 
-### 12.1 The Query Privacy Problem
+The client periodically verifies that shares remain available. Several approaches exist:
 
-Before uploading a blob, a client might want to check if the server already has it-to avoid redundant uploads and save bandwidth. The naive approach sends a HEAD request with the blob's hash. But this reveals information: the server learns which hashes the client is interested in.
+- **HEAD requests**: Query each server for share existence. Simple but reveals access patterns to servers.
+- **Range requests**: Request a byte range and verify its hash, sampling without downloading full shares.
+- **Probabilistic filters**: Servers could publish bloom filters or similar structures enabling local existence checks without revealing queries. This would improve privacy but is not currently part of the Blossom specification.
 
-Over time, a curious server could build a profile of which blobs a client accesses, when they access them, and which blobs are related (queried in close temporal proximity). Even though blob contents are encrypted, access patterns leak information.
-
-### 12.2 Binary Fuse Filters
-
-Binary fuse filters enable existence checking without revealing the query. The server periodically publishes a compact filter representing the set of all blob hashes it stores. Clients download this filter and perform membership tests locally.
-
-A binary fuse filter is a probabilistic data structure supporting set membership queries. For a set of n elements, the filter consumes approximately 9n bits (just over 1 byte per element) and answers "is x in the set?" with:
-
-- **No false negatives**: If x is in the set, the filter always returns true
-- **Tunable false positives**: The filter may incorrectly return true for elements not in the set, with probability configurable to ~1%
-
-The query algorithm computes three hash functions of the queried element, XORs the filter values at those positions, and compares to a fingerprint:
-
-```
-query(x):
-    h0 = hash0(x) mod segment_length
-    h1 = hash1(x) mod segment_length + segment_length
-    h2 = hash2(x) mod segment_length + 2 * segment_length
-    return filter[h0] XOR filter[h1] XOR filter[h2] == fingerprint(x)
-```
-
-Critically, this computation happens entirely on the client. The server never sees the query input.
-
-### 12.3 Filter Distribution
-
-Servers generate and publish their filters periodically-perhaps hourly or daily depending on churn rate. A filter for a server with 1 million blobs requires approximately 1.1 MB, small enough for clients to download and cache.
-
-The filter might be distributed via:
-
-- HTTP endpoint on the Blossom server (`GET /filter`)
-- Nostr event published by the server's identity
-- Out-of-band distribution (IPFS, BitTorrent, etc.)
-
-Clients download filters for their configured servers, then perform local lookups when deciding whether to upload. If the filter indicates a blob might exist (accounting for false positives), the client can either skip uploading or perform a HEAD request to confirm.
-
-### 12.4 Limitations
-
-Binary fuse filters are immutable once constructed. They cannot be updated incrementally-adding a new element requires rebuilding the entire filter. This is acceptable for periodic batch updates but prevents real-time synchronization.
-
-False positives mean clients occasionally skip uploads for blobs the server doesn't actually have. The subsequent fetch will fail, revealing the false positive, and the client can then upload. With a 1% false positive rate, this occurs rarely and has minimal impact.
-
-The filter reveals the total number of blobs the server stores (derivable from filter size). It doesn't reveal which specific blobs or any information about their contents.
+When verification detects missing shares, repair proceeds by fetching k surviving shares, reconstructing the block, re-encoding the missing share, and uploading to a replacement server. The inode and directory chain must then be updated to reflect the new share location.
 
 ---
 
@@ -925,7 +886,7 @@ Possibilities include per-byte pricing with Lightning Network micropayments, sub
 
 A steward service could handle verification and repair automatically, running continuously without user intervention. This requires delegating sufficient authority to perform repairs without granting full account access.
 
-Potential approaches include threshold signatures where the steward holds one share of a multisig, capability tokens authorizing specific repair actions, and read-only access combined with user approval for repairs. Steward design involves complex trust tradeoffs and is deferred to future work.
+Potential approaches include capability tokens authorizing specific repair actions, or read-only access combined with user approval for repairs. Steward design involves complex trust tradeoffs and is deferred to future work.
 
 ### 16.3 Multi-Device Synchronization
 
@@ -965,11 +926,9 @@ Significant work remains for production deployment. Payment integration, automat
 
 5. IETF RFC 5510. Reed-Solomon Forward Error Correction (FEC) Schemes. https://tools.ietf.org/html/rfc5510
 
-6. Graf, T. M., & Lemire, D. (2022). Binary Fuse Filters: Fast and Smaller Than Xor Filters. ACM Journal of Experimental Algorithmics.
+6. BIP-340. Schnorr Signatures for secp256k1. https://bips.dev/340/
 
-7. BIP-340. Schnorr Signatures for secp256k1. https://bips.dev/340/
-
-8. Nostr Protocol. NIP-44: Encrypted Payloads (Versioned). https://github.com/nostr-protocol/nips/blob/master/44.md
+7. Nostr Protocol. NIP-44: Encrypted Payloads (Versioned). https://github.com/nostr-protocol/nips/blob/master/44.md
 
 ---
 
