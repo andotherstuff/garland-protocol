@@ -25,13 +25,14 @@ This document describes a distributed storage system built upon Nostr and Blosso
 8. [Directory Hierarchy](#8-directory-hierarchy)
 9. [State Management via Hash Chain](#9-state-management-via-hash-chain)
 10. [Single-Key Discovery and Recovery](#10-single-key-discovery-and-recovery)
-11. [Transport Layer](#11-transport-layer)
-12. [Verification and Availability Checks](#12-verification-and-availability-checks)
-13. [Garbage Collection](#13-garbage-collection)
-14. [Lifecycle Summary](#14-lifecycle-summary)
-15. [Security Analysis](#15-security-analysis)
-16. [Future Considerations](#16-future-considerations)
-17. [Conclusion](#17-conclusion)
+11. [Passphrase-Protected Storage Identities](#11-passphrase-protected-storage-identities)
+12. [Transport Layer](#12-transport-layer)
+13. [Verification and Availability Checks](#13-verification-and-availability-checks)
+14. [Garbage Collection](#14-garbage-collection)
+15. [Lifecycle Summary](#15-lifecycle-summary)
+16. [Security Analysis](#16-security-analysis)
+17. [Future Considerations](#17-future-considerations)
+18. [Conclusion](#18-conclusion)
 
 ---
 
@@ -613,9 +614,203 @@ If insufficient shares remain available for any blob, that blob is unrecoverable
 
 ---
 
-## 11. Transport Layer
+## 11. Passphrase-Protected Storage Identities
 
-### 11.1 Blossom Protocol
+### 11.1 Motivation
+
+The base design derives all keys from the user's Nostr secret key (nsec). This provides convenient single-key recovery but creates a single point of compromise: an attacker who obtains the nsec gains complete access to all stored data, past and present.
+
+This section describes an optional extension that derives a separate storage identity from the combination of an nsec and a passphrase. The derived identity is itself a valid Nostr keypair, used transparently throughout the system. This approach requires no changes to the core protocol—it simply changes what nsec is used.
+
+### 11.2 Design Goals
+
+The passphrase extension provides several properties:
+
+**Defense in depth**: Compromise of the nsec alone reveals nothing. The attacker must also obtain the passphrase to derive the storage identity.
+
+**Plausible deniability**: Different passphrases derive different storage identities, each with independent data. There is no cryptographic evidence that additional passphrases exist. A user under duress can reveal a decoy passphrase while keeping sensitive data hidden.
+
+**Multiple independent stores**: A single nsec can manage multiple completely separate storage buckets—one per passphrase. These buckets share no keys, no data, and no visible relationship.
+
+**Implementation simplicity**: The passphrase is processed once at the entry point to derive a storage nsec. All subsequent operations use this derived nsec exactly as the base protocol specifies. No other code paths change.
+
+### 11.3 Cryptographic Primitive Selection
+
+The derivation uses only cryptographic primitives already present in the Nostr ecosystem:
+
+| Primitive | Usage | Already Used In |
+|-----------|-------|-----------------|
+| HMAC-SHA256 | PRF for PBKDF2 | NIP-44 |
+| PBKDF2 | Passphrase stretching | BIP-39 |
+| SHA-256 | Hashing | Event IDs, content addressing |
+| secp256k1 | Derived keypair | All Nostr signatures |
+
+This design intentionally avoids introducing new primitives such as Argon2 or BLAKE2, even though they offer stronger properties. The rationale:
+
+1. **Reduced attack surface**: Fewer cryptographic assumptions to audit
+2. **Implementation availability**: Every Nostr client already has these primitives
+3. **Ecosystem consistency**: Matches patterns established by BIP-39 and NIP-44
+4. **Hardware wallet compatibility**: PBKDF2 is available on constrained devices
+
+The tradeoff is reduced resistance to GPU-based attacks compared to memory-hard functions. This is acceptable given the compensating factors discussed in Section 11.7.
+
+### 11.4 Key Derivation Specification
+
+The storage nsec is derived from the user's nsec and passphrase as follows:
+
+```
+function derive_storage_nsec(nsec: bytes[32], passphrase: string) -> bytes[32]:
+
+    // Step 1: Create identity-bound salt
+    // This prevents rainbow tables across different users
+    salt = HMAC-SHA256(
+        key = "garland-v1-salt",
+        message = nsec
+    )
+
+    // Step 2: Stretch passphrase with PBKDF2
+    // Empty string is valid (the "no passphrase" case)
+    stretched = PBKDF2-HMAC-SHA256(
+        passphrase = UTF8(passphrase),
+        salt = salt,
+        iterations = 210000,
+        output_length = 32
+    )
+
+    // Step 3: Combine nsec and stretched passphrase
+    derived_nsec = HMAC-SHA256(
+        key = "garland-v1-nsec",
+        message = nsec || stretched
+    )
+
+    return derived_nsec
+```
+
+The derived output is used directly as a secp256k1 private key. The probability of producing an invalid scalar (zero or ≥ curve order) is approximately 2⁻¹²⁸, which is negligible. Implementations may optionally reduce modulo the curve order for defense in depth.
+
+### 11.5 The Empty Passphrase
+
+When no passphrase is provided, the empty string is used:
+
+```
+storage_nsec = derive_storage_nsec(user_nsec, "")
+```
+
+This is not a special case—the derivation runs identically with `passphrase = ""`. The result is a deterministic storage identity derived from the nsec alone.
+
+The empty-passphrase identity serves as the default or "decoy" storage bucket. Users who never set a passphrase still benefit from the derived identity model, maintaining a clean separation between their social Nostr identity and their storage identity.
+
+### 11.6 Multiple Storage Buckets
+
+Each distinct passphrase produces a distinct storage identity:
+
+```
+nsec + ""           →  npub_A  →  Storage bucket A (default/decoy)
+nsec + "personal"   →  npub_B  →  Storage bucket B
+nsec + "work"       →  npub_C  →  Storage bucket C
+nsec + "sensitive"  →  npub_D  →  Storage bucket D
+```
+
+Each bucket is completely independent:
+
+- **Different keypairs**: Each has its own npub, visible on relays
+- **Separate commit chains**: No `prev` links between buckets
+- **Independent servers**: Can use different Blossom servers
+- **No cryptographic linkage**: Observing npub_A reveals nothing about npub_B
+
+This enables compartmentalized storage where compromise of one passphrase does not affect others.
+
+### 11.7 Security Analysis
+
+**Threat: Attacker obtains nsec only**
+
+The attacker can compute the empty-passphrase storage identity and access that bucket. They cannot determine whether other passphrases exist. To find additional buckets, they must:
+
+1. Guess candidate passphrases
+2. Run PBKDF2 (210,000 iterations) for each guess
+3. Derive the candidate npub
+4. Query relays for commits from that npub
+5. Repeat until a bucket is found or guesses are exhausted
+
+At 210,000 PBKDF2-HMAC-SHA256 iterations, a single CPU core achieves roughly 5-10 guesses per second. A GPU can parallelize this to perhaps 10,000 guesses per second. For a passphrase with 40 bits of entropy (e.g., four random words), exhaustive search requires approximately 2⁴⁰ / 10,000 / 86,400 ≈ 1,200 days of GPU time.
+
+**Threat: Attacker demands passphrase under duress**
+
+The user reveals the empty passphrase (or a decoy passphrase). The attacker obtains access to the corresponding bucket. There is no cryptographic evidence that other buckets exist—each passphrase produces an independent, valid-looking identity. The attacker cannot prove the user is withholding additional passphrases.
+
+**Threat: Weak passphrase**
+
+If the user chooses a weak passphrase like "letmein", it will be found quickly through dictionary attack. This is inherent to any passphrase-based system. Users should be advised to choose strong passphrases for high-security buckets. The empty-passphrase bucket should contain only non-sensitive or decoy data.
+
+**Threat: Side-channel observation**
+
+An attacker who observes multiple derived npubs over time might correlate them through timing analysis, IP addresses, or relay access patterns. The cryptographic derivation provides no protection against operational security failures. Users requiring strong compartmentalization should access different buckets through different network paths.
+
+### 11.8 Comparison with Alternative Approaches
+
+Several alternative designs were considered:
+
+**Passphrase in key hierarchy (not identity derivation)**
+
+An alternative approach derives the master storage key from nsec + passphrase but keeps the same npub for signing. This allows changing passphrases by re-encrypting file keys rather than re-publishing all commits.
+
+| Property | Derived Identity (this design) | Key Hierarchy Only |
+|----------|-------------------------------|-------------------|
+| Protocol changes | None | Modify key derivation |
+| Identity separation | Full (different npub) | None (same npub) |
+| Passphrase change | Re-publish all commits | Re-encrypt file keys |
+| Plausible deniability | Strong | Weak (commits visible) |
+| Data discoverability | Cannot find without passphrase | Can find, cannot decrypt |
+
+The derived identity approach was chosen for its stronger deniability and zero protocol changes.
+
+**Memory-hard KDF (Argon2)**
+
+Argon2 provides stronger resistance to GPU/ASIC attacks through memory-hardness. However, it introduces BLAKE2b, a primitive not used elsewhere in Nostr. The marginal security benefit was judged insufficient to justify the additional cryptographic dependency.
+
+**Higher PBKDF2 iterations**
+
+Iterations could be increased beyond 210,000 at the cost of slower derivation. The current value aligns with OWASP 2023 recommendations for PBKDF2-HMAC-SHA256 and provides a reasonable balance between security and usability. Implementations may offer configurable iteration counts for users with specific requirements.
+
+### 11.9 Implementation Notes
+
+**Iteration count**: The value 210,000 is based on OWASP 2023 guidelines for PBKDF2-HMAC-SHA256. This should be reviewed periodically and increased as hardware improves.
+
+**Passphrase encoding**: Passphrases are encoded as UTF-8 before processing. Implementations should normalize Unicode (NFC recommended) to ensure consistent derivation across platforms.
+
+**Caching**: The derived nsec should be cached in memory for the session duration to avoid repeated PBKDF2 computation. It should never be written to persistent storage.
+
+**UI guidance**: Applications should clearly indicate which storage bucket is active and warn users about the implications of passphrase loss. There is no recovery mechanism—a forgotten passphrase means permanent loss of that bucket's data.
+
+### 11.10 Recovery with Passphrase
+
+The recovery process (Section 10.1) is modified as follows:
+
+1. **Obtain credentials**: User provides nsec and passphrase (empty string if none)
+2. **Derive storage nsec**: Apply the derivation function from Section 11.4
+3. **Derive storage npub**: Compute public key from derived nsec
+4. **Query relays**: Request kind 10097 events with author = storage npub
+5. **Continue as normal**: Decrypt commits, fetch root, traverse structure
+
+The only change is steps 1-3: deriving the storage identity before querying relays. All subsequent operations are identical to the base protocol.
+
+### 11.11 Trade-offs Summary
+
+| Benefit | Cost |
+|---------|------|
+| nsec compromise does not expose data | Must remember passphrase |
+| Plausible deniability | Passphrase change requires full re-publish |
+| Multiple independent stores | Cannot prove ownership across stores |
+| No protocol changes | Storage identity ≠ social identity |
+| Uses existing primitives | Less GPU-resistant than Argon2 |
+
+This extension is optional. Users who prefer single-key simplicity can use the empty passphrase exclusively, treating the derived identity as their sole storage identity. Users who require defense in depth or deniability can leverage multiple passphrases to compartmentalize their data.
+
+---
+
+## 12. Transport Layer
+
+### 12.1 Blossom Protocol
 
 Blossom servers provide content-addressed blob storage over HTTP, authenticated via Nostr events. The protocol is intentionally minimal-servers store bytes and retrieve bytes, nothing more.
 
@@ -631,7 +826,7 @@ Core endpoints:
 
 The `{sha256}` path component is the lowercase hex-encoded SHA-256 hash of the blob's contents. An optional file extension may be appended (e.g., `/{sha256}.pdf`) for MIME type hinting, but servers identify blobs solely by hash.
 
-### 11.2 Authentication
+### 12.2 Authentication
 
 Write operations (PUT, DELETE) require authentication via a Nostr event included in the Authorization header:
 
@@ -659,7 +854,7 @@ The `t` tag specifies the authorized action: "upload", "delete", or "list". The 
 
 Servers verify the signature, confirm the kind is 24242, check that the action matches the `t` tag, validate that the current time is before expiration, and for uploads/deletes, verify the `x` tag matches the blob hash.
 
-### 11.3 Server Responses
+### 12.3 Server Responses
 
 Successful upload returns a blob descriptor:
 
@@ -685,7 +880,7 @@ X-Content-Sha256: abc123def456...
 
 HEAD requests return the same headers without the body, enabling existence checks without downloading content.
 
-### 11.4 Server Interchangeability
+### 12.4 Server Interchangeability
 
 Blossom servers are interchangeable and fungible. A blob uploaded to server A can be retrieved from server B if server B also has it. The content hash serves as a universal identifier across all servers.
 
@@ -700,7 +895,7 @@ The system's erasure coding distributes shares across servers, so migration requ
 
 ---
 
-## 12. Verification and Availability Checks
+## 13. Verification and Availability Checks
 
 The client periodically verifies that shares remain available. Several approaches exist:
 
@@ -712,15 +907,15 @@ When verification detects missing or corrupted shares, repair proceeds by fetchi
 
 ---
 
-## 13. Garbage Collection
+## 14. Garbage Collection
 
-### 13.1 The Accumulation Problem
+### 14.1 The Accumulation Problem
 
 Content-addressed immutable storage naturally accumulates data. Updating a file creates new blobs; the old blobs persist. The directory structure uses copy-on-write semantics, so modifying a deeply nested file creates new blobs for every ancestor directory up to the root. Without cleanup, storage consumption grows monotonically even if the logical dataset size remains constant.
 
 This design places garbage collection responsibility entirely with the client. The system does not automatically delete anything. Users must explicitly choose to delete obsolete data, accepting the tradeoff between storage costs and history preservation.
 
-### 13.2 Reference Tracking
+### 14.2 Reference Tracking
 
 The client maintains knowledge of which blobs are reachable from each commit. A blob is garbage if it's unreachable from any commit the user wishes to preserve.
 
@@ -742,7 +937,7 @@ def traverse(hash, reachable):
 
 Blobs not in the reachable set are candidates for deletion.
 
-### 13.3 Deletion Strategies
+### 14.3 Deletion Strategies
 
 Several strategies for garbage collection exist, offering different tradeoffs:
 
@@ -754,7 +949,7 @@ Several strategies for garbage collection exist, offering different tradeoffs:
 
 **Explicit snapshots**: Mark specific commits as preserved (e.g., monthly snapshots, pre-migration backups). Delete blobs unreachable from any preserved commit.
 
-### 13.4 Deletion Process
+### 14.4 Deletion Process
 
 To delete a garbage blob, all n shares must be deleted from their respective servers. Partial deletion leaves the blob reconstructable from surviving shares.
 
@@ -784,7 +979,7 @@ Deletion authorization uses the same Nostr event mechanism as uploads:
 }
 ```
 
-### 13.5 Metadata Event Garbage Collection
+### 14.5 Metadata Event Garbage Collection
 
 The hash chain of commit events also accumulates over time. Old commit events may be pruned from relays to reduce storage, but this requires care.
 
@@ -798,9 +993,9 @@ In practice, commit events are small (kilobytes) and relay storage is cheap. Mos
 
 ---
 
-## 14. Lifecycle Summary
+## 15. Lifecycle Summary
 
-### 14.1 Initial Setup
+### 15.1 Initial Setup
 
 A new user performs one-time setup:
 
@@ -811,7 +1006,7 @@ A new user performs one-time setup:
 5. Create an empty root directory
 6. Publish the genesis commit event
 
-### 14.2 Adding Files
+### 15.2 Adding Files
 
 To add a file to the storage system:
 
@@ -829,7 +1024,7 @@ To add a file to the storage system:
 8. Recursively update ancestors to the root
 9. Stage changes for the next commit
 
-### 14.3 Committing Changes
+### 15.3 Committing Changes
 
 When the user saves:
 
@@ -840,7 +1035,7 @@ When the user saves:
 5. Sign and publish commit to relays
 6. Clear local staged changes
 
-### 14.4 Reading Files
+### 15.4 Reading Files
 
 To read a file by path:
 
@@ -854,7 +1049,7 @@ To read a file by path:
 5. Concatenate blocks and remove padding
 6. Return file contents
 
-### 14.5 Verification and Repair
+### 15.5 Verification and Repair
 
 Periodically, the client should verify data availability:
 
@@ -870,7 +1065,7 @@ Periodically, the client should verify data availability:
    - Update inode with new share locations
    - Commit the updated inodes
 
-### 14.6 Garbage Collection
+### 15.6 Garbage Collection
 
 When storage costs warrant cleanup:
 
@@ -883,9 +1078,9 @@ When storage costs warrant cleanup:
 
 ---
 
-## 15. Security Analysis
+## 16. Security Analysis
 
-### 15.1 Confidentiality
+### 16.1 Confidentiality
 
 Storage servers observe only uniformly-sized encrypted blobs. They cannot determine:
 
@@ -898,25 +1093,25 @@ Storage servers observe only uniformly-sized encrypted blobs. They cannot determ
 
 The encryption is semantic-identical plaintexts produce different ciphertexts due to random per-file keys. Servers cannot detect when users store the same content.
 
-### 15.2 Integrity
+### 16.2 Integrity
 
 Content addressing provides integrity at multiple levels. Share hashes verify individual share integrity. Block hashes (stored in inodes) verify decrypted block integrity. The Merkle DAG structure verifies structural integrity-any modification to any blob changes the root hash.
 
 Poly1305 authentication tags detect ciphertext tampering. Even if an attacker modifies stored ciphertext in a way that produces a valid hash, decryption will fail authentication.
 
-### 15.3 Availability
+### 16.3 Availability
 
 Erasure coding ensures availability despite server failures. With (n, k) parameters, data survives the loss of any n - k servers. The hash chain ensures commit history survives relay churn as long as at least one relay retains the events.
 
 The system does not provide availability against censorship or targeted attacks where adversaries deliberately destroy more than n - k shares simultaneously.
 
-### 15.4 Authentication
+### 16.4 Authentication
 
 Nostr signatures authenticate all state changes. Only the holder of the nsec can publish valid commit events. Blossom authorization events prevent unauthorized uploads or deletions.
 
 Relays and servers can verify signature validity but cannot forge signatures. A compromised relay could refuse to serve events (availability attack) but cannot produce fake commits (integrity preserved).
 
-### 15.5 Key Compromise
+### 16.5 Key Compromise
 
 If the nsec is compromised, all security properties fail. The attacker can:
 
@@ -929,35 +1124,35 @@ Key management is outside this system's scope. Users should employ standard prac
 
 ---
 
-## 16. Future Considerations
+## 17. Future Considerations
 
-### 16.1 Payment Integration
+### 17.1 Payment Integration
 
 Storage servers require compensation for resources consumed. Integration with payment systems would enable sustainable server operation.
 
 Possibilities include per-byte pricing with Lightning Network micropayments, subscription models with ecash or traditional payment, and storage markets where servers compete on price and reliability. Payment integration should not compromise privacy-payments should not link to specific blobs or reveal access patterns.
 
-### 16.2 Steward Services
+### 17.2 Steward Services
 
 A steward service could handle verification and repair automatically, running continuously without user intervention. This requires delegating sufficient authority to perform repairs without granting full account access.
 
 Potential approaches include capability tokens authorizing specific repair actions, or read-only access combined with user approval for repairs. Steward design involves complex trust tradeoffs and is deferred to future work.
 
-### 16.3 Multi-Device Synchronization
+### 17.3 Multi-Device Synchronization
 
 The current design supports multiple devices through the commit chain, but conflict resolution is minimal. Enhanced multi-device support might include automatic merging for non-conflicting changes, three-way merge for file-level conflicts, operational transformation for collaborative editing, and CRDT-based structures for specific data types.
 
-### 16.4 Deduplication
+### 17.4 Deduplication
 
 Content addressing naturally deduplicates identical files-they hash to the same blob. Block-level deduplication across files is more complex. Content-defined chunking using rolling hashes (Rabin fingerprinting) could identify common blocks across similar files, reducing storage for versioned documents or near-duplicates.
 
-### 16.5 Proof of Retrievability
+### 17.5 Proof of Retrievability
 
 More sophisticated cryptographic proofs could enable efficient verification without downloading data. Proof of Retrievability (PoR) schemes allow servers to prove they hold data by responding to challenges. This could reduce verification bandwidth from O(data size) to O(security parameter).
 
 ---
 
-## 17. Conclusion
+## 18. Conclusion
 
 This design provides a practical architecture for durable, private, personal storage built on existing Nostr and Blossom infrastructure. The layered architecture separates concerns: fixed-size blocks provide privacy through uniformity, erasure coding provides durability through redundancy, authenticated encryption provides confidentiality and integrity, the Merkle DAG provides efficient updates and verification, and the hash chain provides auditable history with conflict detection.
 
@@ -985,6 +1180,10 @@ Significant work remains for production deployment. Payment integration, automat
 
 7. Nostr Protocol. NIP-44: Encrypted Payloads (Versioned). https://github.com/nostr-protocol/nips/blob/master/44.md
 
+8. IETF RFC 2898. PKCS #5: Password-Based Cryptography Specification Version 2.0. https://tools.ietf.org/html/rfc2898
+
+9. BIP-39. Mnemonic code for generating deterministic keys. https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+
 ---
 
 ## Appendix A: Notation Reference
@@ -999,6 +1198,7 @@ Significant work remains for production deployment. Payment integration, automat
 | GF(2^8) | Galois Field with 256 elements |
 | H(x) | SHA-256 hash function |
 | HKDF | HMAC-based Key Derivation Function |
+| PBKDF2 | Passphrase-stretching Key Derivation Function (RFC 2898) |
 | XChaCha20 | Extended-nonce ChaCha20 stream cipher |
 | Poly1305 | One-time authenticator MAC |
 
@@ -1019,5 +1219,8 @@ Standard, well-analyzed, widely implemented.
 **Commit distribution**: 5+ Nostr relays  
 Ensures commit retrievability despite relay failures.
 
-**Verification interval**: Weekly  
+**Verification interval**: Weekly
 Balance between catching failures early and minimizing bandwidth.
+
+**Passphrase derivation**: PBKDF2-HMAC-SHA256, 210,000 iterations
+Based on OWASP 2023 recommendations. Provides ~0.5-1 second derivation time on typical hardware while resisting offline attacks.

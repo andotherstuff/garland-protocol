@@ -45,6 +45,13 @@ See [v0](v0/) and [v0.1](v0.1/) for the design documents.
 - *v0:* No guidance on pruning old events
 - *v0.1:* Explicit strategy for garbage collecting old commit events from relays while preserving designated snapshots
 
+**Passphrase-Protected Storage Identities** *(new in v0.1)*
+- Optional passphrase derives a separate storage identity (nsec + passphrase → derived nsec)
+- Defense in depth: nsec compromise alone reveals nothing
+- Plausible deniability: multiple passphrases create independent, unlinkable storage buckets
+- Uses only existing Nostr primitives (PBKDF2-HMAC-SHA256, no new dependencies)
+- Zero protocol changes: derived nsec used transparently throughout
+
 ## Status
 
 This is early architecture research. The design documents are ready for feedback—no implementation exists yet.
