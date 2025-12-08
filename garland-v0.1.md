@@ -27,12 +27,13 @@ This document describes a distributed storage system built upon Nostr and Blosso
 10. [Single-Key Discovery and Recovery](#10-single-key-discovery-and-recovery)
 11. [Passphrase-Protected Storage Identities](#11-passphrase-protected-storage-identities)
 12. [Transport Layer](#12-transport-layer)
-13. [Verification and Availability Checks](#13-verification-and-availability-checks)
+13. [Verification and Repair](#13-verification-and-repair)
 14. [Garbage Collection](#14-garbage-collection)
-15. [Lifecycle Summary](#15-lifecycle-summary)
-16. [Security Analysis](#16-security-analysis)
-17. [Future Considerations](#17-future-considerations)
-18. [Conclusion](#18-conclusion)
+15. [What Servers Observe](#15-what-servers-observe)
+16. [Lifecycle Summary](#16-lifecycle-summary)
+17. [Security Analysis](#17-security-analysis)
+18. [Future Considerations](#18-future-considerations)
+19. [Conclusion](#19-conclusion)
 
 ---
 
@@ -126,7 +127,7 @@ Non-final blocks: [content: B bytes]
 Final block:      [content_length: u32_be][content: content_length bytes][padding: zeros]
 ```
 
-This scheme enables unambiguous removal of padding during reconstruction. For the final block, content_length contains `S mod B` (or B if S is an exact multiple of B). Non-final blocks contain exactly B bytes of content with no overhead.
+This scheme enables unambiguous removal of padding during reconstruction. For the final block, content_length contains `S mod B`. A value of 0 indicates the final block is completely full—that is, the file size is an exact multiple of B. Non-final blocks contain exactly B bytes of content with no overhead.
 
 ### 4.2 Privacy Through Uniformity
 
@@ -270,7 +271,7 @@ metadata_key = HKDF-SHA256(
 )
 ```
 
-The commit key encrypts commit event content and sequence number tags. The metadata key encrypts inodes and directory blobs. Separating these keys limits the impact of potential key compromise and clarifies the encryption scope.
+The commit key encrypts commit event content. The metadata key encrypts inodes and directory blobs. Separating these keys limits the impact of potential key compromise and clarifies the encryption scope.
 
 Each file receives a randomly generated 256-bit key at creation time. This per-file key is stored within the file's inode, encrypted using XChaCha20-Poly1305 with the metadata key. Random per-file keys ensure that identical files produce different ciphertexts, preventing content-based correlation.
 
@@ -484,21 +485,19 @@ A commit event has the following structure:
   "pubkey": "<owner's public key>",
   "created_at": 1701907200,
   "tags": [
-    ["prev", "<event ID of previous commit>"],
-    ["seq", "<encrypted sequence number>"]
+    ["prev", "<event ID of previous commit>"]
   ],
   "content": "<encrypted payload>",
   "sig": "<Schnorr signature>"
 }
 ```
 
-The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The `seq` tag contains an encrypted sequence number for ordering (see Section 9.5 on metadata privacy).
+The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The genesis commit omits this tag. The `created_at` timestamp provides temporal ordering; Nostr relays serve events in reverse chronological order by default, enabling efficient head discovery (see Section 9.5).
 
 The encrypted `content` field is encrypted using XChaCha20-Poly1305 with a key derived from the master storage key (see Section 6.1). It contains:
 
 ```json
 {
-  "seq": 42,
   "root_inode": {
     "hash": "<content hash of root directory inode>",
     "shares": [
@@ -513,7 +512,7 @@ The encrypted `content` field is encrypted using XChaCha20-Poly1305 with a key d
 }
 ```
 
-The `seq` field is the plaintext sequence number (the tag contains it encrypted for ordering without decryption). The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted. The optional `message` field allows human-readable commit descriptions.
+The `root_inode` field contains the content hash and share locations for the root directory blob. The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted from storage servers. The optional `message` field allows human-readable commit descriptions.
 
 ### 9.2 Commit Process
 
@@ -561,12 +560,49 @@ Clients can implement time-travel functionality: given any historical commit, th
 
 This history has storage implications. Old commits reference old blobs which must be retained for history to remain valid. Users who don't need history can garbage collect aggressively. Users who value history must retain more data. Section 14 discusses garbage collection in detail.
 
-### 9.5 Metadata Privacy
+### 9.5 Head Discovery and Chain Traversal
 
-Commit events are publicly visible on relays. To minimize metadata leakage, sensitive fields are encrypted:
+The commit chain requires two operations: finding the current head for normal use, and traversing the full chain for recovery or history access.
 
-- **Sequence number**: The `seq` tag contains the sequence number encrypted with the master key. Clients can decrypt and sort locally. Observers see only opaque ciphertext and cannot determine commit frequency or total count.
-- **Root hash**: Stored only in the encrypted content, not as a plaintext tag. Observers cannot detect when the filesystem changes.
+#### Finding the Chain Head
+
+Nostr relays return events in reverse chronological order by `created_at` timestamp. To find the current chain head, clients query for kind 1097 events with `limit=1`:
+
+```
+REQ: ["REQ", <sub_id>, {"kinds": [1097], "authors": [<pubkey>], "limit": 1}]
+```
+
+The relay returns the most recent commit event. In normal operation—where commits are created sequentially from a single device or with proper conflict resolution—this is the chain head.
+
+For robustness, clients should verify the result by checking that no other commit references this event as its `prev`. If multiple devices commit simultaneously, the most recent by timestamp wins; the other becomes a fork requiring reconciliation.
+
+#### Full Chain Traversal
+
+For disaster recovery or history reconstruction, clients traverse the complete chain:
+
+1. Query for all kind 1097 events by the owner's pubkey (no limit)
+2. Build an index: `event_id → event` and `prev → event_id`
+3. Identify the head: the event whose ID appears in no other event's `prev` tag
+4. Walk backward via `prev` tags until reaching genesis (the commit with no `prev` tag)
+
+This traversal reconstructs the complete history without requiring any decryption. The chain structure is visible in plaintext `prev` tags; only the content (root hashes, garbage lists, messages) requires decryption.
+
+#### Fork Detection
+
+Forks occur when two commits share the same `prev` value—both claim to follow the same parent. During traversal:
+
+1. If multiple events have the same `prev`, a fork exists
+2. The event with the later `created_at` timestamp is the canonical head
+3. The other branch may contain commits that need merging or represent conflicting changes
+
+For personal single-device usage, forks are rare. Multi-device deployments should implement merge strategies (Section 9.2).
+
+### 9.6 Metadata Privacy
+
+Commit events are publicly visible on relays. To minimize metadata leakage, sensitive fields are encrypted within the `content` field:
+
+- **Root hash**: Stored only in encrypted content. Observers cannot detect when the filesystem changes or correlate commits with blob uploads.
+- **Garbage list**: Stored only in encrypted content. Observers cannot determine when data is being deleted.
 - **Commit message**: Stored only in encrypted content.
 
 The only plaintext metadata exposed is:
@@ -574,7 +610,7 @@ The only plaintext metadata exposed is:
 - The `created_at` timestamp (required by Nostr protocol)
 - The owner's public key (inherent to Nostr signatures)
 
-The `prev` tag reveals the existence of a chain but not its contents. Timing analysis of `created_at` timestamps can reveal activity patterns; users concerned about this can batch commits or add random delays.
+The `prev` tag reveals chain structure but not contents. Observers can count commits and analyze timing patterns from `created_at` timestamps, but cannot determine what changed between commits or how much data each commit affects. Users concerned about timing analysis can batch commits or add random delays to `created_at` values (within Nostr's tolerance for clock skew).
 
 ---
 
@@ -586,15 +622,16 @@ Disaster recovery requires only the owner's Nostr secret key (nsec). No backup f
 
 1. **Derive public key**: Compute npub from nsec using secp256k1
 2. **Discover relays**: Query the user's relay list (NIP-65 outbox model) or use known relays
-3. **Query relays**: Request kind 1097 events with author = npub
-4. **Derive master key**: Compute master storage key from nsec via HKDF
-5. **Find chain head**: Decrypt the `seq` tag of each commit, identify the highest sequence number
-6. **Decrypt commit**: Decrypt the commit's content field using the master key
-7. **Fetch root**: Download k shares of the root directory inode using URLs from the commit
-8. **Decode and decrypt**: Erasure-decode and decrypt the root directory
-9. **Traverse**: Recursively fetch any desired files through the directory structure
+3. **Derive master key**: Compute master storage key from nsec via HKDF
+4. **Find chain head**: Query relays for kind 1097 events with author = npub and limit = 1; the most recent commit by `created_at` is the head
+5. **Decrypt commit**: Decrypt the head commit's content field using the commit key derived from master key
+6. **Fetch root**: Download k shares of the root directory inode using URLs from the commit
+7. **Decode and decrypt**: Erasure-decode and decrypt the root directory
+8. **Traverse**: Recursively fetch any desired files through the directory structure
 
-The Nostr relay network serves as the discovery layer. Relays are interchangeable-the client can query any relay that might have stored the owner's events. Since events are signed, their authenticity is verifiable regardless of which relay provides them.
+For full history recovery, omit the limit parameter in step 4, fetch all commits, and traverse the chain via `prev` tags as described in Section 9.5.
+
+The Nostr relay network serves as the discovery layer. Relays are interchangeable—the client can query any relay that might have stored the owner's events. Since events are signed, their authenticity is verifiable regardless of which relay provides them.
 
 ### 10.2 Relay Selection
 
@@ -867,15 +904,149 @@ The system's erasure coding distributes shares across servers, so migration requ
 
 ---
 
-## 13. Verification and Availability Checks
+## 13. Verification and Repair
 
-The client periodically verifies that shares remain available. Several approaches exist:
+### 13.1 The Verification Service
 
-- **HEAD requests**: Query each server for share existence. Simple but reveals access patterns to servers.
-- **Range requests**: Request a byte range from the server and compare against the locally-stored share data. Since the client retains shares locally (or can reconstruct them from local file copies), it can verify server integrity without trusting precomputed hashes.
-- **Probabilistic filters**: Servers could publish bloom filters or similar structures enabling local existence checks without revealing queries. This would improve privacy but is not currently part of the Blossom specification.
+Data durability requires ongoing verification that shares remain available across storage servers. This verification can be performed by the client application directly, or delegated to a separate steward service that runs independently.
 
-When verification detects missing or corrupted shares, repair proceeds by fetching k surviving shares, reconstructing the block, re-encoding the missing share, and uploading to a replacement server. The inode and directory chain must then be updated to reflect the new share location.
+A steward is a process—potentially running on a dedicated server, a home machine, or a cloud instance—that:
+
+1. Periodically reads the owner's current state from the commit chain
+2. Challenges each share location to verify data availability
+3. Detects failures and initiates repair when shares become unavailable
+4. Updates the commit chain with new share locations after repair
+
+The steward requires sufficient credentials to perform these operations. In the simplest model, it holds the owner's nsec (or derived storage nsec if using passphrase protection). More sophisticated deployments might use delegated keys with limited authority—sufficient to read manifests and upload replacement shares, but unable to delete data or modify directory structure.
+
+The verification frequency depends on the user's durability requirements and tolerance for data loss. Weekly verification catches most server failures before they cascade. Daily verification provides stronger guarantees at higher bandwidth cost. Users with critical data might verify continuously, while archival users might verify monthly.
+
+### 13.2 Verification Approaches
+
+Several approaches exist for verifying share availability, each with different tradeoffs between simplicity, bandwidth, privacy, and integrity guarantees.
+
+#### Existence Checks via HEAD Requests
+
+The simplest approach queries each server for share existence:
+
+```
+HEAD /{share_hash}
+```
+
+If the server returns 200 OK, the share exists. If it returns 404 Not Found, the share is missing.
+
+| Aspect | Assessment |
+|--------|------------|
+| Bandwidth | Minimal—only HTTP headers exchanged |
+| Privacy | Poor—servers observe exactly which shares are being verified and when |
+| Integrity | None—confirms existence but not correctness; a server could return 200 for corrupted data |
+| Implementation | Trivial—standard HTTP |
+
+This approach suits low-threat environments where servers are trusted not to serve corrupted data and privacy from servers is not a concern.
+
+#### Content Verification via Byte Range Requests
+
+A stronger approach downloads a portion of each share and verifies it against known-good data:
+
+```
+GET /{share_hash}
+Range: bytes=offset-end
+```
+
+The verifier selects a random byte range, requests those bytes, and compares them against locally-stored share data or recomputes them from local file copies.
+
+| Aspect | Assessment |
+|--------|------------|
+| Bandwidth | Moderate—downloads partial share data; configurable via range size |
+| Privacy | Poor—servers observe which shares are accessed |
+| Integrity | Strong—verifies actual content, not just metadata; random sampling makes undetected corruption probabilistically unlikely |
+| Implementation | Moderate—requires local storage of shares or ability to reconstruct them |
+
+For complete integrity verification, the entire share can be downloaded and hashed:
+
+```
+H(downloaded_bytes) == share_hash
+```
+
+This guarantees the server holds the exact data, at the cost of downloading every byte.
+
+#### Privacy-Preserving Verification via Server Filters
+
+Blossom servers may publish probabilistic data structures (such as fuse filters) listing all blob hashes they store. Clients can query these filters locally without revealing which specific blobs they're checking. Fuse filters are a modern alternative to Bloom filters, offering better space efficiency and query performance while providing the same probabilistic membership testing.
+
+```
+GET /filter
+→ Returns fuse filter of all stored blob hashes
+
+Client checks: share_hash ∈ filter?
+```
+
+| Aspect | Assessment |
+|--------|------------|
+| Bandwidth | Low—download filter once, check many blobs locally |
+| Privacy | Good—server cannot determine which blobs client is verifying |
+| Integrity | None—confirms server claims to have the blob; does not verify content |
+| Implementation | Requires server support; filter format must be standardized |
+
+This approach can be combined with selective content verification: use filters for routine existence checks, then perform byte-range verification on a random sample or when filters indicate potential issues.
+
+#### Hybrid Verification Strategy
+
+A practical deployment might combine approaches:
+
+1. **Daily**: Download server filters, check all shares exist in filters
+2. **Weekly**: Perform HEAD requests for any shares not covered by filters
+3. **Monthly**: Download and fully verify a random 1% sample of shares
+4. **On suspicion**: Fully verify any share that failed a lighter check
+
+This balances bandwidth, privacy, and integrity while catching most failure modes.
+
+### 13.3 Repair Flow
+
+When verification detects that share i of block b is unavailable or corrupted:
+
+1. **Assess damage**: Count how many shares of block b remain available. If fewer than k shares survive, the block is unrecoverable.
+
+2. **Fetch surviving shares**: Download any k of the surviving shares from their respective servers. Track which share indices were retrieved.
+
+3. **Reconstruct the block**: Apply erasure decoding using the k retrieved shares to recover the original encrypted block.
+
+4. **Regenerate missing share**: Re-encode the block to produce all n shares. Extract share i (and any other missing shares).
+
+5. **Select replacement server**: Choose a new server to host the replacement share. Prefer servers not already storing shares of this block to maintain failure independence.
+
+6. **Upload replacement**: Upload share i to the replacement server, obtaining its URL.
+
+7. **Update inode**: Modify the block's share list to reflect the new server URL. This creates a new inode blob.
+
+8. **Propagate changes**: The modified inode changes its content hash. Update parent directories up to the root.
+
+9. **Commit**: Publish a new commit event with the updated root, referencing the previous commit.
+
+Repair is expensive—it requires downloading k full shares (potentially hundreds of kilobytes each) and uploading at least one new share. However, repair occurs only on failure, and early detection prevents cascading failures that could make blocks unrecoverable.
+
+### 13.4 Steward Authority Models
+
+The authority granted to a steward determines what operations it can perform autonomously versus what requires user intervention.
+
+**Full authority**: The steward holds the owner's nsec and can perform any operation—verification, repair, and even deletion or restructuring. This model is simple but provides no protection if the steward is compromised.
+
+**Repair-only authority**: The steward holds a delegated key or capability token that allows:
+- Reading commit events and decrypting manifests
+- Downloading shares for verification
+- Uploading new shares to servers
+- Publishing repair commits (new root with updated share locations)
+
+But does not allow:
+- Deleting shares from servers
+- Modifying directory structure
+- Garbage collection
+
+This limits damage from steward compromise to storage cost (uploading junk) rather than data loss.
+
+**Read-only authority**: The steward can only verify and report. It alerts the user to failures but cannot initiate repair. The user must manually authorize each repair operation. This provides maximum control at the cost of availability—if the user is unavailable when repair is needed, data may become unrecoverable.
+
+The appropriate model depends on the user's threat model, availability requirements, and operational capacity.
 
 ---
 
@@ -965,9 +1136,86 @@ In practice, commit events are small (kilobytes) and relay storage is cheap. Mos
 
 ---
 
-## 15. Lifecycle Summary
+## 15. What Servers Observe
 
-### 15.1 Initial Setup
+Understanding what information storage servers can and cannot learn is essential for evaluating the system's privacy properties. This section consolidates the privacy analysis from the server's perspective.
+
+### 15.1 What Blossom Servers Observe
+
+From any individual Blossom server's perspective:
+
+**Observable:**
+- Fixed-size encrypted blobs, all identical in size
+- The SHA-256 hash of each blob (used as identifier)
+- The public key that uploaded each blob (from authorization events)
+- Timestamps of upload, access, and deletion requests
+- IP addresses and access patterns for requests
+- Total storage consumed by each public key
+
+**Not observable:**
+- Whether a blob contains file data, directory metadata, or an inode
+- Original file names, types, or sizes
+- Relationships between blobs (which blobs belong to the same file)
+- Directory structure or hierarchy depth
+- Which blobs are currently "live" versus orphaned from garbage collection
+- The plaintext content of any blob
+
+The uniformity of blob sizes is critical. Without it, servers could infer file types from characteristic sizes, correlate related blobs by timing and size patterns, or distinguish small configuration files from chunks of large media files. With uniform sizing, a 100-byte text file produces the same 256 KiB blob as any chunk of a multi-gigabyte video.
+
+### 15.2 What Nostr Relays Observe
+
+Relays storing commit events observe:
+
+**Observable:**
+- The public key publishing commits (owner identity or derived storage identity)
+- The `created_at` timestamp of each commit
+- The `prev` tag linking commits into a chain
+- The encrypted `content` field (opaque ciphertext)
+- The total number of commits over time
+- Timing patterns of commit activity
+
+**Not observable:**
+- The root hash or any blob references (encrypted in content)
+- Commit messages (encrypted in content)
+- Garbage collection lists (encrypted in content)
+- What changed between commits
+- Dataset size or structure
+
+The `prev` tag reveals that commits form a chain but not what the chain contains. An observer can count commits and analyze timing but cannot determine whether a commit added one file or a thousand, or whether it deleted data via garbage collection.
+
+### 15.3 Cross-Server Correlation
+
+An adversary controlling multiple servers or observing network traffic might attempt correlation:
+
+**Possible correlations:**
+- Uploads to multiple servers at similar times likely belong to the same block
+- A user uploading to servers A, B, C is probably using (n=3) erasure coding
+- Burst patterns suggest file additions; steady patterns suggest verification
+
+**Mitigations:**
+- Upload shares to different servers with random delays
+- Use different network paths (Tor, VPN rotation) for different servers
+- Avoid predictable verification schedules
+
+Even with correlation, the adversary learns only about activity patterns, not content. They might infer "user X added data at time T" but not "user X uploaded family photos."
+
+### 15.4 Information Leak Summary
+
+| Information | Leaked To | Mitigation |
+|-------------|-----------|------------|
+| Total storage volume | Each Blossom server | Inherent; use more servers to fragment |
+| Activity timing | Servers and relays | Random delays, batching |
+| Public key identity | Servers and relays | Derived storage identities (Section 11) |
+| Number of commits | Relays | Batch changes into fewer commits |
+| IP address | Servers and relays | Tor, VPN, proxy rotation |
+
+The system prioritizes content privacy over metadata privacy. What you store is completely hidden; that you store something and roughly how much is observable. Users requiring metadata privacy should employ network-level anonymization.
+
+---
+
+## 16. Lifecycle Summary
+
+### 16.1 Initial Setup
 
 A new user performs one-time setup:
 
@@ -978,7 +1226,7 @@ A new user performs one-time setup:
 5. Create an empty root directory
 6. Publish the genesis commit event
 
-### 15.2 Adding Files
+### 16.2 Adding Files
 
 To add a file to the storage system:
 
@@ -996,7 +1244,7 @@ To add a file to the storage system:
 8. Recursively update ancestors to the root
 9. Stage changes for the next commit
 
-### 15.3 Committing Changes
+### 16.3 Committing Changes
 
 When the user saves:
 
@@ -1007,7 +1255,7 @@ When the user saves:
 5. Sign and publish commit to relays
 6. Clear local staged changes
 
-### 15.4 Reading Files
+### 16.4 Reading Files
 
 To read a file by path:
 
@@ -1021,7 +1269,7 @@ To read a file by path:
 5. Concatenate blocks and remove padding
 6. Return file contents
 
-### 15.5 Verification and Repair
+### 16.5 Verification and Repair
 
 Periodically, the client should verify data availability:
 
@@ -1037,7 +1285,7 @@ Periodically, the client should verify data availability:
    - Update inode with new share locations
    - Commit the updated inodes
 
-### 15.6 Garbage Collection
+### 16.6 Garbage Collection
 
 When storage costs warrant cleanup:
 
@@ -1050,9 +1298,9 @@ When storage costs warrant cleanup:
 
 ---
 
-## 16. Security Analysis
+## 17. Security Analysis
 
-### 16.1 Confidentiality
+### 17.1 Confidentiality
 
 Storage servers observe only uniformly-sized encrypted blobs. They cannot determine:
 
@@ -1065,25 +1313,25 @@ Storage servers observe only uniformly-sized encrypted blobs. They cannot determ
 
 The encryption is semantic-identical plaintexts produce different ciphertexts due to random per-file keys. Servers cannot detect when users store the same content.
 
-### 16.2 Integrity
+### 17.2 Integrity
 
 Content addressing provides integrity at multiple levels. Share hashes verify individual share integrity. Block hashes (stored in inodes) verify decrypted block integrity. The Merkle DAG structure verifies structural integrity-any modification to any blob changes the root hash.
 
 Poly1305 authentication tags detect ciphertext tampering. Even if an attacker modifies stored ciphertext in a way that produces a valid hash, decryption will fail authentication.
 
-### 16.3 Availability
+### 17.3 Availability
 
 Erasure coding ensures availability despite server failures. With (n, k) parameters, data survives the loss of any n - k servers. The hash chain ensures commit history survives relay churn as long as at least one relay retains the events.
 
 The system does not provide availability against censorship or targeted attacks where adversaries deliberately destroy more than n - k shares simultaneously.
 
-### 16.4 Authentication
+### 17.4 Authentication
 
 Nostr signatures authenticate all state changes. Only the holder of the nsec can publish valid commit events. Blossom authorization events prevent unauthorized uploads or deletions.
 
 Relays and servers can verify signature validity but cannot forge signatures. A compromised relay could refuse to serve events (availability attack) but cannot produce fake commits (integrity preserved).
 
-### 16.5 Key Compromise
+### 17.5 Key Compromise
 
 If the nsec is compromised, all security properties fail. The attacker can:
 
@@ -1096,35 +1344,35 @@ Key management is outside this system's scope. Users should employ standard prac
 
 ---
 
-## 17. Future Considerations
+## 18. Future Considerations
 
-### 17.1 Payment Integration
+### 18.1 Payment Integration
 
 Storage servers require compensation for resources consumed. Integration with payment systems would enable sustainable server operation.
 
 Possibilities include per-byte pricing with Lightning Network micropayments, subscription models with ecash or traditional payment, and storage markets where servers compete on price and reliability. Payment integration should not compromise privacy-payments should not link to specific blobs or reveal access patterns.
 
-### 17.2 Steward Services
+### 18.2 Steward Services
 
 A steward service could handle verification and repair automatically, running continuously without user intervention. This requires delegating sufficient authority to perform repairs without granting full account access.
 
 Potential approaches include capability tokens authorizing specific repair actions, or read-only access combined with user approval for repairs. Steward design involves complex trust tradeoffs and is deferred to future work.
 
-### 17.3 Multi-Device Synchronization
+### 18.3 Multi-Device Synchronization
 
 The current design supports multiple devices through the commit chain, but conflict resolution is minimal. Enhanced multi-device support might include automatic merging for non-conflicting changes, three-way merge for file-level conflicts, operational transformation for collaborative editing, and CRDT-based structures for specific data types.
 
-### 17.4 Deduplication
+### 18.4 Deduplication
 
 Content addressing naturally deduplicates identical files-they hash to the same blob. Block-level deduplication across files is more complex. Content-defined chunking using rolling hashes (Rabin fingerprinting) could identify common blocks across similar files, reducing storage for versioned documents or near-duplicates.
 
-### 17.5 Proof of Retrievability
+### 18.5 Proof of Retrievability
 
 More sophisticated cryptographic proofs could enable efficient verification without downloading data. Proof of Retrievability (PoR) schemes allow servers to prove they hold data by responding to challenges. This could reduce verification bandwidth from O(data size) to O(security parameter).
 
 ---
 
-## 18. Conclusion
+## 19. Conclusion
 
 This design provides a practical architecture for durable, private, personal storage built on existing Nostr and Blossom infrastructure. The layered architecture separates concerns: fixed-size blocks provide privacy through uniformity, erasure coding provides durability through redundancy, authenticated encryption provides confidentiality and integrity, the Merkle DAG provides efficient updates and verification, and the hash chain provides auditable history with conflict detection.
 
