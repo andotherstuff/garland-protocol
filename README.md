@@ -17,7 +17,37 @@ Garland is a distributed storage system that lets you back up personal data acro
 
 Files are chunked into fixed-size blocks, encrypted, erasure-coded into shares, and distributed across Blossom servers. A hierarchical namespace (like a filesystem) is maintained via content-addressed manifests stored the same way. The root pointer lives on Nostr relays as a signed event.
 
-See [v0](v0/) for the full design document.
+See [v0](v0/) and [v0.1](v0.1/) for the design documents.
+
+## Changelog: v0 → v0.1
+
+**State Management**
+- *v0:* Single replaceable Nostr event (kind 30097) storing current root hash
+- *v0.1:* Hash chain of commit events with `prev` tag linking to predecessor, enabling full history traversal, conflict detection, and auditability
+
+**Conflict Handling**
+- *v0:* Undefined — last-write-wins with silent data loss
+- *v0.1:* Commits reference parent via `prev` tag; clients detect divergence before committing and must reconcile
+
+**Garbage Collection**
+- *v0:* "Orphaned shares eventually garbage-collected by servers" (undefined mechanism)
+- *v0.1:* Explicit client responsibility with reference tracking, deletion strategies, and `garbage` field in commits announcing deleted blobs
+
+**Verification and Repair**
+- *v0:* Dedicated steward service running independently with owner's nsec or delegated key
+- *v0.1:* Client performs periodic verification and repair; steward deferred to future work
+
+**Existence Queries**
+- *v0:* Not addressed
+- *v0.1:* Binary fuse filters published by servers enable privacy-preserving local membership checks without revealing query patterns
+
+**Update Model**
+- *v0:* Implicit copy-on-write with unspecified commit timing
+- *v0.1:* Explicit snapshot-based workflow — changes accumulate locally, committed via deliberate save action
+
+**Metadata Events**
+- *v0:* No guidance on pruning old events
+- *v0.1:* Explicit strategy for garbage collecting old commit events from relays while preserving designated snapshots
 
 ## Status
 
