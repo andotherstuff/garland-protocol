@@ -148,7 +148,7 @@ However, block count does not reveal:
 - Directory structure depth or breadth
 - What fraction is user data vs. metadata
 
-This uniformity has costs. Small files incur substantial padding overhead: a 1 KiB file stored in a 256 KiB block wastes 99.6% of the space, and after erasure coding with overhead factor 1.5x, that 1 KiB file consumes 384 KiB of storage across servers. This design accepts that tradeoff. Systems requiring efficient small-file storage should consider alternative approaches, but such optimizations necessarily leak information about file sizes.
+This uniformity has costs. Small files incur substantial padding overhead: a 1 KiB file stored in a 256 KiB block wastes 99.6% of the space, and after erasure coding with overhead factor 1.5x, that 1 KiB file consumes 384 KiB of storage across servers. This design accepts that tradeoff. Applications with many small files should consider aggregating them into archives (tar, zip) before storage to reduce overhead while preserving privacy.
 
 ---
 
@@ -156,7 +156,7 @@ This uniformity has costs. Small files incur substantial padding overhead: a 1 K
 
 ### 5.1 Reed-Solomon Coding
 
-Each encrypted block undergoes erasure coding to provide redundancy across multiple storage servers. The system employs Reed-Solomon codes over GF(2^8), which are Maximum Distance Separable (MDS) and achieve optimal storage efficiency for any fault tolerance level.
+Each encrypted block undergoes erasure coding to provide redundancy across multiple storage servers. The system employs Reed-Solomon codes over GF(2^8), a finite field with 256 elements convenient for byte-oriented operations. These codes are Maximum Distance Separable (MDS), meaning they achieve the theoretical optimum: any k shares suffice to reconstruct k source symbols, with no wasted redundancy.
 
 A Reed-Solomon (n, k) code transforms k source symbols into n encoded symbols such that any k of the n symbols suffice to reconstruct the original data. The system tolerates the loss of any n - k symbols from server failures, network partitions, or data corruption.
 
@@ -181,7 +181,7 @@ P(x) = b₀ + b₁x + b₂x² + ... + b_{k-1}x^{k-1}
 
 The n shares contain the evaluations of P(x) at n distinct points. Using systematic encoding, the first k shares contain the original k pieces unchanged, followed by n - k parity shares.
 
-In practice, encoding multiplies the source vector by a k × n generator matrix derived from a Vandermonde matrix. The computational cost is modest: encoding a 256 KiB block completes in milliseconds.
+In practice, encoding multiplies the source vector by a k × n generator matrix (typically derived from a Vandermonde or Cauchy matrix, chosen for their guaranteed invertibility properties). The computational cost is modest: encoding a 256 KiB block completes in milliseconds.
 
 ### 5.3 Decoding Process
 
@@ -231,19 +231,19 @@ Encryption employs a hierarchical key derivation scheme rooted in the user's Nos
 ```
 nsec + passphrase (empty string default)
   │
-  └─► Storage nsec (derived via PBKDF2, see Section 6.4)
+  └─► Storage nsec (PBKDF2, see Section 6.4)
         │
-        └─► Master Storage Key (derived via HKDF)
+        └─► Master Key (HKDF)
               │
-              ├─► Commit Key (for encrypting commit events)
+              ├─► Commit Key (HKDF-Expand)
               │
-              ├─► Metadata Key (for encrypting inodes and directories)
+              ├─► Metadata Key (HKDF-Expand)
               │
-              ├─► Per-Blob Auth Key (derived from master key + blob hash, see Section 11.2)
+              ├─► Per-Blob Auth Key (HKDF-Expand with share_id, see Section 11.2)
               │
               └─► Per-File Key (random, stored encrypted in inode)
                     │
-                    └─► Per-Block Key (derived via HKDF from file key + block index)
+                    └─► Per-Block Key (HKDF-Expand with block index)
 ```
 
 The master storage key is derived from the storage nsec (not the raw user nsec):
@@ -251,28 +251,26 @@ The master storage key is derived from the storage nsec (not the raw user nsec):
 ```
 master_key = HKDF-SHA256(
     IKM = storage_nsec,
-    salt = "nostr-storage-v1",
-    info = "master-key",
+    salt = None,
+    info = "garland-v1:master",
     length = 32
 )
 ```
 
-This derivation is deterministic: the same nsec + passphrase always produces the same master key, enabling recovery without storing additional secrets. The storage nsec derivation is described in Section 6.4.
+Per RFC 5869, salt should be independent of IKM; using empty salt is explicitly permitted and avoids any dependency concerns. The storage_nsec already has high entropy from PBKDF2, so the extraction phase primarily provides domain separation via the info string. This derivation is fully deterministic: the same nsec + passphrase always produces the same master key, enabling recovery without storing additional secrets. The storage nsec derivation is described in Section 6.4.
 
-Purpose-specific keys are derived from the master key:
+Purpose-specific keys are derived from the master key using HKDF-Expand (no additional salt needed since master_key is already a PRK):
 
 ```
-commit_key = HKDF-SHA256(
-    IKM = master_key,
-    salt = "nostr-storage-v1",
-    info = "commit-encryption",
+commit_key = HKDF-Expand(
+    PRK = master_key,
+    info = "garland-v1:commit",
     length = 32
 )
 
-metadata_key = HKDF-SHA256(
-    IKM = master_key,
-    salt = "nostr-storage-v1",
-    info = "metadata-encryption",
+metadata_key = HKDF-Expand(
+    PRK = master_key,
+    info = "garland-v1:metadata",
     length = 32
 )
 ```
@@ -281,13 +279,14 @@ The commit key encrypts commit event content. The metadata key encrypts inodes a
 
 Each file receives a randomly generated 256-bit key at creation time. This per-file key is stored within the file's inode, encrypted with the metadata key. Random per-file keys ensure that identical files produce different ciphertexts, preventing content-based correlation.
 
-Per-block keys are derived from the file key to avoid nonce reuse concerns:
+**File modification**: When a file is modified, the client creates a new inode with a freshly generated random file_key. The file_key is never reused across file versions. This is essential because the encryption uses a fixed zero nonce; reusing a file_key for different content would cause keystream reuse, enabling trivial plaintext recovery.
+
+Per-block keys are derived from the file key:
 
 ```
-block_key = HKDF-SHA256(
-    IKM = file_key,
-    salt = "block-encryption",
-    info = block_index_as_u64_be,
+block_key = HKDF-Expand(
+    PRK = file_key,
+    info = "garland-v1:block:" || block_index_as_u64_be,
     length = 32
 )
 ```
@@ -299,19 +298,18 @@ Each block is encrypted using ChaCha20, a stream cipher widely used in the Nostr
 The encryption process for block i with file key K_f:
 
 ```
-block_key = HKDF-SHA256(K_f, "block-encryption", i, 32)
-nonce = random_bytes(12)
-ciphertext = ChaCha20-Encrypt(block_key, nonce, plaintext_block)
-encrypted_block = nonce || ciphertext
+block_key = HKDF-Expand(K_f, "garland-v1:block:" || i, 32)
+nonce = 0x000000000000000000000000  (12 zero bytes)
+ciphertext = ChaCha20(block_key, nonce, plaintext_block)
 ```
 
-The 12-byte nonce is prepended to the ciphertext. Total overhead per block is 12 bytes, negligible relative to the 256 KiB block size.
+Since each block uses a unique derived key, a fixed zero nonce is cryptographically safe: the (key, nonce) pair is never reused. This avoids 12 bytes of overhead per block.
 
 Integrity is provided by the content-addressing scheme. Each share is stored and retrieved by its SHA-256 hash, and if a server returns data that doesn't match the requested hash, it is rejected. After decryption, the plaintext block hash is verified against the value stored in the inode. This layered integrity checking at the storage layer makes encryption-layer authentication unnecessary.
 
 ### 6.3 Metadata Encryption
 
-File inodes and directory entries contain sensitive metadata: filenames, sizes, timestamps, and structural relationships. This metadata is encrypted using the metadata key derived from the master key.
+File inodes and directory entries contain sensitive metadata: filenames, sizes, timestamps, and structural relationships. The client encrypts this metadata using the metadata key derived from the master key.
 
 When storing an inode or directory, the client:
 1. Serializes the structure to JSON
@@ -320,7 +318,7 @@ When storing an inode or directory, the client:
 4. Erasure-codes the encrypted block into n shares
 5. Uploads shares to n servers
 
-The resulting shares are indistinguishable from file data shares. This recursive structure means servers observe only uniform encrypted blocks. They cannot determine whether a block contains a photograph, a text document, a directory listing, or another inode. The type and structure of stored data is completely opaque.
+The resulting shares are indistinguishable from file data shares. See Section 14 for detailed privacy analysis.
 
 ### 6.4 Storage Identity Derivation
 
@@ -338,7 +336,7 @@ function derive_storage_nsec(nsec: bytes[32], passphrase: string) -> bytes[32]:
     return HMAC-SHA256(key = "garland-v1-nsec", message = nsec || stretched)
 ```
 
-The derivation uses only primitives present in the Nostr ecosystem (HMAC-SHA256, PBKDF2, secp256k1), avoiding new dependencies. The identity-bound salt prevents rainbow tables across users. The 210,000 iteration count follows OWASP 2023 guidelines for PBKDF2-HMAC-SHA256. The derived output is used directly as a secp256k1 private key.
+The derivation uses only primitives present in the Nostr ecosystem (HMAC-SHA256, PBKDF2, secp256k1), avoiding new dependencies. PBKDF2 (Password-Based Key Derivation Function 2) deliberately slows key derivation through repeated hashing, making brute-force attacks expensive. The identity-bound salt prevents rainbow tables across users. The 210,000 iteration count follows OWASP 2023 guidelines for PBKDF2-HMAC-SHA256. The derived output is used directly as a secp256k1 private key.
 
 **Default passphrase**: When no passphrase is specified, the empty string is used. This is not a special case; the derivation runs identically with `passphrase = ""`. The empty-string bucket serves as the default storage location.
 
@@ -351,6 +349,8 @@ nsec + "work"     →  npub_C  →  Storage bucket C
 ```
 
 There is no cryptographic linkage between buckets. An attacker with the nsec can access the empty-passphrase bucket but cannot determine if others exist (plausible deniability). Finding additional buckets requires brute-forcing passphrases through 210,000 PBKDF2 iterations per guess.
+
+**Important**: The derived storage identity SHOULD NOT be used for other Nostr purposes (social posting, direct messages, etc.). Commit events published to relays expose the storage pubkey. If that pubkey appears in other contexts, the storage account becomes linked to those activities, undermining privacy. Treat the storage identity as single-purpose.
 
 **Recovery**: Provide nsec + passphrase, derive storage nsec, then proceed with normal recovery (Section 10). A forgotten passphrase means permanent loss of that bucket; there is no recovery mechanism.
 
@@ -403,7 +403,7 @@ The `hash` field in each block entry contains the SHA-256 hash of the plaintext 
 
 The `shares` array is ordered by share index (0 to n-1). The array position determines the share index, which is required for erasure decoding. During reconstruction, the client fetches shares from their listed servers, tracking which indices were successfully retrieved. Once k shares are obtained, decoding can proceed. Storing share indices in the inode (rather than embedding them in share data) provides better privacy: servers cannot determine a share's position in the erasure scheme.
 
-Inodes themselves are stored as blobs following the identical pipeline. An inode is serialized, padded, encrypted, erasure-coded, and distributed. The resulting structure is referenced by its content hash, forming a node in the Merkle DAG.
+The client stores inodes as blobs using the same pipeline: serialize, pad, encrypt, erasure-code, and distribute. The resulting structure's content hash forms a node in the Merkle DAG.
 
 ### 7.1 Large File Inodes
 
@@ -458,13 +458,13 @@ A directory is simply a file whose decrypted contents enumerate named entries an
 }
 ```
 
-This directory blob is encrypted and stored identically to file inodes: same block size, same encryption, same erasure coding. From a server's perspective, all blobs are indistinguishable.
-
-Entry names are stored within the encrypted blob, invisible to servers. An observer cannot determine how many files exist, what they are named, or how the directory tree is structured. They see only a collection of uniform encrypted blocks.
+The client encrypts and stores directory blobs identically to file inodes: same block size, same encryption, same erasure coding. Entry names remain within the encrypted blob, invisible to servers.
 
 ### 8.2 Merkle DAG Structure
 
-The directory hierarchy forms a Merkle Directed Acyclic Graph (DAG). Each node, whether file inode or directory, is identified by the content hash of its encrypted representation. Parent nodes contain the hashes of their children.
+The directory hierarchy forms a Merkle Directed Acyclic Graph (DAG), a tree-like structure where each node is identified by the cryptographic hash of its contents and parent nodes include the hashes of their children. Any modification to a child changes its hash, which propagates up to the root.
+
+Each node, whether file inode or directory, is identified by the content hash of its encrypted representation.
 
 ```
                     ┌─────────────────┐
@@ -528,7 +528,7 @@ A commit event has the following structure:
 
 The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The genesis commit omits this tag. The `created_at` timestamp provides temporal ordering; Nostr relays serve events in reverse chronological order by default, enabling efficient head discovery (see Section 9.5).
 
-The encrypted `content` field is encrypted using ChaCha20 with the commit key derived from the master storage key (see Section 6.1). It contains:
+The client encrypts the `content` field using ChaCha20 with the commit key derived from the master storage key (see Section 6.1). It contains:
 
 ```json
 {
@@ -608,7 +608,7 @@ REQ: ["REQ", <sub_id>, {"kinds": [1097], "authors": [<pubkey>], "limit": 1}]
 
 The relay returns the most recent commit event. In normal operation, where commits are created sequentially from a single device or with proper conflict resolution, this is the chain head.
 
-For robustness, clients should verify the result by checking that no other commit references this event as its `prev`. If multiple devices commit simultaneously, the most recent by timestamp wins; the other becomes a fork requiring reconciliation.
+If different relays return different "most recent" events (due to propagation delays or clock skew), clients should fall back to full chain traversal to determine the true head. Fetch all commits, build the chain graph, and identify the canonical head as described below.
 
 #### Full Chain Traversal
 
@@ -656,7 +656,7 @@ Disaster recovery requires the owner's Nostr secret key (nsec) and passphrase (e
 
 1. **Derive storage identity**: Combine nsec + passphrase to derive storage nsec (Section 6.4)
 2. **Derive storage npub**: Compute public key from storage nsec using secp256k1
-3. **Discover relays**: Query the user's relay list (NIP-65 outbox model) or use known relays
+3. **Discover relays**: Use client-configured storage relays (see Section 10.2)
 4. **Derive master key**: Compute master storage key from storage nsec via HKDF
 5. **Find chain head**: Query relays for kind 1097 events with author = storage npub and limit = 1; the most recent commit by `created_at` is the head
 6. **Decrypt commit**: Decrypt the head commit's content field using the commit key derived from master key
@@ -672,11 +672,15 @@ The Nostr relay network serves as the discovery layer. Relays are interchangeabl
 
 Recovery reliability depends on commit events being retrievable from at least one relay. Users should publish commits to multiple relays and periodically verify that relays still hold their events.
 
+**Storage relay list**: Clients maintain an encrypted list of relays dedicated to storage commits. This list is stored within the storage system itself (as an encrypted blob) and also cached locally. The relay list is independent of the user's social NIP-65 relay list, preventing linkage between storage and social identities.
+
+For initial setup or recovery without a cached relay list, clients use a hardcoded set of well-known public relays to bootstrap. Once the commit chain is located, the encrypted relay list can be retrieved and decrypted for ongoing use.
+
 Relay selection strategies include:
 
 - **Personal relays**: Relays the user operates or trusts, likely to retain events long-term
 - **Paid relays**: Commercial relays with retention guarantees
-- **Popular public relays**: High availability but may prune old events
+- **Public bootstrap relays**: Used only for initial discovery; storage relays should be explicitly configured
 
 The commit events are small (a few kilobytes) and don't grow with dataset size. Storing them across many relays is inexpensive and dramatically improves recovery reliability.
 
@@ -721,10 +725,9 @@ Some servers require authentication for write operations (PUT, DELETE) via a Nos
 Using a single pubkey for all uploads allows servers to correlate blobs to the same owner, undermining privacy. To prevent this, the default authentication mode derives a unique keypair for each blob:
 
 ```
-blob_auth_privkey = HKDF-SHA256(
-    IKM = master_key,
-    salt = "blob-auth-v1",
-    info = share_id,
+blob_auth_privkey = HKDF-Expand(
+    PRK = master_key,
+    info = "garland-v1:auth:" || share_id,
     length = 32
 )
 blob_auth_pubkey = secp256k1_pubkey(blob_auth_privkey)
@@ -1054,7 +1057,7 @@ In practice, commit events are small (kilobytes) and relay storage is cheap. Mos
 
 ## 14. What Servers Observe
 
-Understanding what information storage servers can and cannot learn is essential for evaluating the system's privacy properties. This section consolidates the privacy analysis from the server's perspective.
+This section provides the consolidated privacy analysis for security review. It details what information storage servers can and cannot learn, forming the basis for evaluating the system's privacy properties.
 
 ### 14.1 What Blossom Servers Observe
 
@@ -1300,6 +1303,10 @@ Content addressing naturally deduplicates identical files since they hash to the
 ### 17.5 Proof of Retrievability
 
 More sophisticated cryptographic proofs could enable efficient verification without downloading data. Proof of Retrievability (PoR) schemes allow servers to prove they hold data by responding to challenges. This could reduce verification bandwidth from O(data size) to O(security parameter).
+
+### 17.6 Key Commitment
+
+ChaCha20 (like most stream ciphers) lacks key commitment: an adversary could theoretically construct ciphertext that decrypts to different valid plaintexts under different keys. For single-user storage this is not exploitable, but future multi-user extensions or partial key leakage scenarios might benefit from key-committing AEAD constructions.
 
 ---
 
