@@ -35,7 +35,7 @@ See [garland-v0.md](garland-v0.md) and [garland-v0.1.md](garland-v0.1.md) for th
 
 **Verification and Repair**
 - *v0:* Dedicated steward service running independently with owner's nsec; verifies via range requests
-- *v0.1:* Multiple verification approaches (HEAD requests, byte range verification, fuse filters) with tradeoff analysis; detailed steward service model with authority levels (full, repair-only, read-only); explicit repair flow
+- *v0.1:* Multiple verification approaches (HEAD requests, byte range verification, fuse filters) with tradeoff analysis; steward service model; explicit repair flow
 
 **Update Model**
 - *v0:* Implicit copy-on-write with unspecified commit timing
@@ -47,7 +47,7 @@ See [garland-v0.md](garland-v0.md) and [garland-v0.1.md](garland-v0.1.md) for th
 
 **Passphrase-Protected Storage Identities**
 - *v0:* Not supported — nsec alone controls all data
-- *v0.1:* Optional passphrase derives a separate storage identity (nsec + passphrase → derived nsec); enables defense in depth and plausible deniability with independent, unlinkable storage buckets
+- *v0.1:* Optional passphrase derives a separate storage identity (Section 6.4); enables defense in depth and plausible deniability with independent, unlinkable storage buckets
 
 **Large File Handling**
 - *v0:* Inode size unbounded — large files could exceed block limits
@@ -64,6 +64,10 @@ See [garland-v0.md](garland-v0.md) and [garland-v0.1.md](garland-v0.1.md) for th
 **Erasure Coding**
 - *v0:* Required; parameters unspecified
 - *v0.1:* Optional; k=1 enables simple replication (n identical copies, no encoding), k>1 enables erasure coding; parameter table with overhead/tolerance tradeoffs
+
+**Blossom Authentication**
+- *v0:* Single pubkey for all uploads (allows server correlation)
+- *v0.1:* Per-blob derived authentication keys by default; each blob appears to come from a different user; optional identity key mode for billing
 
 **Privacy Analysis**
 - *v0:* Section on "What Servers Observe"

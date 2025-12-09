@@ -9,7 +9,7 @@
 
 ## Abstract
 
-This document describes a distributed storage system built upon Nostr and Blossom infrastructure that provides durable, privacy-preserving storage for immutable blobs through erasure coding across independent servers. The system maintains a hierarchical namespace analogous to a filesystem through content-addressed manifests organized in a Merkle DAG structure. State evolution is tracked via a cryptographically-linked hash chain of commit events, enabling complete auditability and straightforward disaster recovery. The entire dataset-including all historical state-remains recoverable from a single cryptographic key. This design prioritizes user sovereignty: the owner explicitly controls when changes are committed, which servers store their data, and when obsolete data is garbage collected.
+This document describes a distributed storage system built upon Nostr and Blossom infrastructure that provides durable, privacy-preserving storage for immutable blobs through erasure coding across independent servers. The system maintains a hierarchical namespace analogous to a filesystem through content-addressed manifests organized in a Merkle DAG structure. State evolution is tracked via a cryptographically-linked hash chain of commit events, enabling complete auditability and straightforward disaster recovery. The entire dataset, including all historical state, remains recoverable from a single cryptographic key. This design prioritizes user sovereignty: the owner explicitly controls when changes are committed, which servers store their data, and when obsolete data is garbage collected.
 
 ---
 
@@ -25,21 +25,20 @@ This document describes a distributed storage system built upon Nostr and Blosso
 8. [Directory Hierarchy](#8-directory-hierarchy)
 9. [State Management via Hash Chain](#9-state-management-via-hash-chain)
 10. [Single-Key Discovery and Recovery](#10-single-key-discovery-and-recovery)
-11. [Passphrase-Protected Storage Identities](#11-passphrase-protected-storage-identities)
-12. [Transport Layer](#12-transport-layer)
-13. [Verification and Repair](#13-verification-and-repair)
-14. [Garbage Collection](#14-garbage-collection)
-15. [What Servers Observe](#15-what-servers-observe)
-16. [Lifecycle Summary](#16-lifecycle-summary)
-17. [Security Analysis](#17-security-analysis)
-18. [Future Considerations](#18-future-considerations)
-19. [Conclusion](#19-conclusion)
+11. [Transport Layer](#11-transport-layer)
+12. [Verification and Repair](#12-verification-and-repair)
+13. [Garbage Collection](#13-garbage-collection)
+14. [What Servers Observe](#14-what-servers-observe)
+15. [Lifecycle Summary](#15-lifecycle-summary)
+16. [Security Analysis](#16-security-analysis)
+17. [Future Considerations](#17-future-considerations)
+18. [Conclusion](#18-conclusion)
 
 ---
 
 ## 1. Introduction
 
-The proliferation of cloud storage services has created a fundamental tension between convenience and sovereignty. Users gain seamless synchronization across devices but surrender control over their data to third parties who may inspect it, monetize it, lose it, or deny access to it. The alternative-self-hosted infrastructure-demands technical expertise and ongoing maintenance that most users cannot provide.
+The proliferation of cloud storage services has created a fundamental tension between convenience and sovereignty. Users gain seamless synchronization across devices but surrender control over their data to third parties who may inspect it, monetize it, lose it, or deny access to it. The alternative, self-hosted infrastructure, demands technical expertise and ongoing maintenance that most users cannot provide.
 
 This system addresses a specific need: reliable long-term storage of personal data across unreliable infrastructure, with complete privacy from storage providers and full recoverability from a single secret. The design assumes that individual storage providers may disappear without warning, yet data should survive as long as a sufficient subset of providers remains operational.
 
@@ -127,7 +126,7 @@ Non-final blocks: [content: B bytes]
 Final block:      [content_length: u32_be][content: content_length bytes][padding: zeros]
 ```
 
-This scheme enables unambiguous removal of padding during reconstruction. For the final block, content_length contains `S mod B`. A value of 0 indicates the final block is completely full—that is, the file size is an exact multiple of B. Non-final blocks contain exactly B bytes of content with no overhead.
+This scheme enables unambiguous removal of padding during reconstruction. For the final block, content_length contains `S mod B`. A value of 0 indicates the final block is completely full, meaning the file size is an exact multiple of B. Non-final blocks contain exactly B bytes of content with no overhead.
 
 ### 4.2 Privacy Through Uniformity
 
@@ -149,7 +148,7 @@ However, block count does not reveal:
 - Directory structure depth or breadth
 - What fraction is user data vs. metadata
 
-This uniformity has costs. Small files incur substantial padding overhead-a 1 KiB file stored in a 256 KiB block wastes 99.6% of the space, and after erasure coding with overhead factor 1.5x, that 1 KiB file consumes 384 KiB of storage across servers. This design accepts that tradeoff. Systems requiring efficient small-file storage should consider alternative approaches, but such optimizations necessarily leak information about file sizes.
+This uniformity has costs. Small files incur substantial padding overhead: a 1 KiB file stored in a 256 KiB block wastes 99.6% of the space, and after erasure coding with overhead factor 1.5x, that 1 KiB file consumes 384 KiB of storage across servers. This design accepts that tradeoff. Systems requiring efficient small-file storage should consider alternative approaches, but such optimizations necessarily leak information about file sizes.
 
 ---
 
@@ -157,7 +156,7 @@ This uniformity has costs. Small files incur substantial padding overhead-a 1 Ki
 
 ### 5.1 Reed-Solomon Coding
 
-Each encrypted block undergoes erasure coding to provide redundancy across multiple storage servers. The system employs Reed-Solomon codes over GF(2^8), which are Maximum Distance Separable (MDS)—achieving optimal storage efficiency for any fault tolerance level.
+Each encrypted block undergoes erasure coding to provide redundancy across multiple storage servers. The system employs Reed-Solomon codes over GF(2^8), which are Maximum Distance Separable (MDS) and achieve optimal storage efficiency for any fault tolerance level.
 
 A Reed-Solomon (n, k) code transforms k source symbols into n encoded symbols such that any k of the n symbols suffice to reconstruct the original data. The system tolerates the loss of any n - k symbols from server failures, network partitions, or data corruption.
 
@@ -182,11 +181,11 @@ P(x) = b₀ + b₁x + b₂x² + ... + b_{k-1}x^{k-1}
 
 The n shares contain the evaluations of P(x) at n distinct points. Using systematic encoding, the first k shares contain the original k pieces unchanged, followed by n - k parity shares.
 
-In practice, encoding multiplies the source vector by a k × n generator matrix derived from a Vandermonde matrix. The computational cost is modest-encoding a 256 KiB block completes in milliseconds.
+In practice, encoding multiplies the source vector by a k × n generator matrix derived from a Vandermonde matrix. The computational cost is modest: encoding a 256 KiB block completes in milliseconds.
 
 ### 5.3 Decoding Process
 
-Erasure decoding exploits the key property that erasure locations are known-we know which servers failed, we simply don't have their data. This differs from error correction, where corrupted symbols must first be identified.
+Erasure decoding exploits the key property that erasure locations are known: we know which servers failed, we simply don't have their data. This differs from error correction, where corrupted symbols must first be identified.
 
 Given any k received shares, reconstruction proceeds as follows. Form a k × k matrix by selecting the columns of GM corresponding to the received shares. This submatrix is guaranteed to be invertible due to the MDS property. Compute its inverse. Multiply the received shares by this inverse to obtain the original source blocks.
 
@@ -205,7 +204,7 @@ The choice of n and k determines the tradeoff between storage overhead, fault to
 | 4 | 7 | 1.75× | 3 failures | 7 |
 | 6 | 9 | 1.50× | 3 failures | 9 |
 
-**Simple replication (k=1)**: When k=1, erasure coding degenerates to simple replication—each share is an identical copy of the full encrypted block. Any single server can provide the complete block with no decoding required. This configuration trades storage efficiency (n× overhead) for operational simplicity and maximum fault tolerance (survives n−1 failures). It suits users who prioritize simplicity over storage cost, or who have access to few servers. Note that with k=1, all servers store blobs with identical hashes, enabling potential cross-server correlation; with k>1, each share has a unique hash.
+**Simple replication (k=1)**: When k=1, erasure coding degenerates to simple replication where each share is an identical copy of the full encrypted block. Any single server can provide the complete block with no decoding required. This configuration trades storage efficiency (n× overhead) for operational simplicity and maximum fault tolerance (survives n−1 failures). It suits users who prioritize simplicity over storage cost, or who have access to few servers. Note that with k=1, all servers store blobs with identical hashes, enabling potential cross-server correlation; with k>1, each share has a unique hash.
 
 **Erasure coding (k>1)**: For personal storage, (n=3, k=2) or (n=5, k=3) provides a reasonable balance. The former tolerates one server failure with 50% overhead; the latter tolerates two failures with 67% overhead. Users with access to more servers or heightened durability requirements may choose higher parameters.
 
@@ -219,7 +218,7 @@ Each share is content-addressed by the SHA-256 hash of its bytes:
 share_id = SHA256(share_bytes)
 ```
 
-Blossom servers store and retrieve shares solely by this identifier. They possess no information about which file, block, or user a share belongs to. The share_id serves as both the storage key and the integrity check-if a server returns data whose hash doesn't match the requested ID, the data is corrupt or fraudulent and must be discarded.
+Blossom servers store and retrieve shares solely by this identifier. They possess no information about which file, block, or user a share belongs to. The share_id serves as both the storage key and the integrity check: if a server returns data whose hash doesn't match the requested ID, the data is corrupt or fraudulent and must be discarded.
 
 ---
 
@@ -227,34 +226,38 @@ Blossom servers store and retrieve shares solely by this identifier. They posses
 
 ### 6.1 Key Hierarchy
 
-Encryption employs a hierarchical key derivation scheme rooted in the user's Nostr identity. This hierarchy enables fine-grained key management while maintaining the single-key recovery property.
+Encryption employs a hierarchical key derivation scheme rooted in the user's Nostr identity. The user's nsec is always combined with a passphrase (empty string by default) to derive a storage identity, which then derives all storage keys.
 
 ```
-nsec (Nostr secret key)
+nsec + passphrase (empty string default)
   │
-  └─► Master Storage Key (derived via HKDF)
+  └─► Storage nsec (derived via PBKDF2, see Section 6.4)
         │
-        ├─► Commit Key (derived, for encrypting commit events)
-        │
-        ├─► Metadata Key (derived, for encrypting inodes and directories)
-        │
-        └─► Per-File Key (random, stored encrypted in inode)
+        └─► Master Storage Key (derived via HKDF)
               │
-              └─► Per-Block Key (derived via HKDF from file key + block index)
+              ├─► Commit Key (for encrypting commit events)
+              │
+              ├─► Metadata Key (for encrypting inodes and directories)
+              │
+              ├─► Per-Blob Auth Key (derived from master key + blob hash, see Section 11.2)
+              │
+              └─► Per-File Key (random, stored encrypted in inode)
+                    │
+                    └─► Per-Block Key (derived via HKDF from file key + block index)
 ```
 
-The master storage key is derived deterministically from the nsec:
+The master storage key is derived from the storage nsec (not the raw user nsec):
 
 ```
 master_key = HKDF-SHA256(
-    IKM = nsec,
+    IKM = storage_nsec,
     salt = "nostr-storage-v1",
     info = "master-key",
     length = 32
 )
 ```
 
-This derivation is deterministic-the same nsec always produces the same master key-enabling recovery without storing additional secrets.
+This derivation is deterministic: the same nsec + passphrase always produces the same master key, enabling recovery without storing additional secrets. The storage nsec derivation is described in Section 6.4.
 
 Purpose-specific keys are derived from the master key:
 
@@ -304,11 +307,11 @@ encrypted_block = nonce || ciphertext
 
 The 12-byte nonce is prepended to the ciphertext. Total overhead per block is 12 bytes, negligible relative to the 256 KiB block size.
 
-Integrity is provided by the content-addressing scheme. Each share is stored and retrieved by its SHA-256 hash—if a server returns data that doesn't match the requested hash, it is rejected. After decryption, the plaintext block hash is verified against the value stored in the inode. This layered integrity checking at the storage layer makes encryption-layer authentication unnecessary.
+Integrity is provided by the content-addressing scheme. Each share is stored and retrieved by its SHA-256 hash, and if a server returns data that doesn't match the requested hash, it is rejected. After decryption, the plaintext block hash is verified against the value stored in the inode. This layered integrity checking at the storage layer makes encryption-layer authentication unnecessary.
 
 ### 6.3 Metadata Encryption
 
-File inodes and directory entries contain sensitive metadata-filenames, sizes, timestamps, and structural relationships. This metadata is encrypted using the metadata key derived from the master key.
+File inodes and directory entries contain sensitive metadata: filenames, sizes, timestamps, and structural relationships. This metadata is encrypted using the metadata key derived from the master key.
 
 When storing an inode or directory, the client:
 1. Serializes the structure to JSON
@@ -318,6 +321,38 @@ When storing an inode or directory, the client:
 5. Uploads shares to n servers
 
 The resulting shares are indistinguishable from file data shares. This recursive structure means servers observe only uniform encrypted blocks. They cannot determine whether a block contains a photograph, a text document, a directory listing, or another inode. The type and structure of stored data is completely opaque.
+
+### 6.4 Storage Identity Derivation
+
+The storage nsec is always derived from the user's nsec combined with a passphrase. This derivation serves two purposes: it separates the storage identity from the user's social Nostr identity, and it enables multiple independent storage buckets via different passphrases.
+
+```
+function derive_storage_nsec(nsec: bytes[32], passphrase: string) -> bytes[32]:
+    salt = HMAC-SHA256(key = "garland-v1-salt", message = nsec)
+    stretched = PBKDF2-HMAC-SHA256(
+        passphrase = UTF8(passphrase),
+        salt = salt,
+        iterations = 210000,
+        output_length = 32
+    )
+    return HMAC-SHA256(key = "garland-v1-nsec", message = nsec || stretched)
+```
+
+The derivation uses only primitives present in the Nostr ecosystem (HMAC-SHA256, PBKDF2, secp256k1), avoiding new dependencies. The identity-bound salt prevents rainbow tables across users. The 210,000 iteration count follows OWASP 2023 guidelines for PBKDF2-HMAC-SHA256. The derived output is used directly as a secp256k1 private key.
+
+**Default passphrase**: When no passphrase is specified, the empty string is used. This is not a special case; the derivation runs identically with `passphrase = ""`. The empty-string bucket serves as the default storage location.
+
+**Multiple buckets**: Each passphrase produces a distinct storage identity with independent keys, commit chain, and data:
+
+```
+nsec + ""         →  npub_A  →  Storage bucket A (default)
+nsec + "personal" →  npub_B  →  Storage bucket B
+nsec + "work"     →  npub_C  →  Storage bucket C
+```
+
+There is no cryptographic linkage between buckets. An attacker with the nsec can access the empty-passphrase bucket but cannot determine if others exist (plausible deniability). Finding additional buckets requires brute-forcing passphrases through 210,000 PBKDF2 iterations per guess.
+
+**Recovery**: Provide nsec + passphrase, derive storage nsec, then proceed with normal recovery (Section 10). A forgotten passphrase means permanent loss of that bucket; there is no recovery mechanism.
 
 ---
 
@@ -362,17 +397,17 @@ An inode contains all information necessary to reconstruct a file. After decrypt
 }
 ```
 
-The `key` field contains the per-file encryption key, encrypted with the metadata key. File content is encrypted to the file key, and the file key is encrypted to the metadata key. This hierarchy enables recovery from a single nsec while keeping file keys isolated.
+The `key` field contains the per-file encryption key, encrypted with the metadata key. File content is encrypted to the file key, and the file key is encrypted to the metadata key. This hierarchy enables recovery from nsec + passphrase while keeping file keys isolated.
 
 The `hash` field in each block entry contains the SHA-256 hash of the plaintext block before encryption. This enables integrity verification after decryption: if the decrypted block's hash doesn't match, either the ciphertext was corrupted, the wrong key was used, or the inode itself is corrupt.
 
-The `shares` array is ordered by share index (0 to n-1). The array position determines the share index, which is required for erasure decoding. During reconstruction, the client fetches shares from their listed servers, tracking which indices were successfully retrieved. Once k shares are obtained, decoding can proceed. Storing share indices in the inode (rather than embedding them in share data) provides better privacy-servers cannot determine a share's position in the erasure scheme.
+The `shares` array is ordered by share index (0 to n-1). The array position determines the share index, which is required for erasure decoding. During reconstruction, the client fetches shares from their listed servers, tracking which indices were successfully retrieved. Once k shares are obtained, decoding can proceed. Storing share indices in the inode (rather than embedding them in share data) provides better privacy: servers cannot determine a share's position in the erasure scheme.
 
 Inodes themselves are stored as blobs following the identical pipeline. An inode is serialized, padded, encrypted, erasure-coded, and distributed. The resulting structure is referenced by its content hash, forming a node in the Merkle DAG.
 
 ### 7.1 Large File Inodes
 
-Files with many blocks may produce inodes exceeding the standard block size. With (n=5, k=3) erasure coding, each block entry requires approximately 500 bytes for share IDs and server URLs. A file with 500,000 blocks would generate a ~250 MB inode—far exceeding the 256 KiB block limit.
+Files with many blocks may produce inodes exceeding the standard block size. With (n=5, k=3) erasure coding, each block entry requires approximately 500 bytes for share IDs and server URLs. A file with 500,000 blocks would generate a ~250 MB inode, far exceeding the 256 KiB block limit.
 
 For files exceeding approximately 500 blocks, the inode uses an indirect block structure:
 
@@ -423,13 +458,13 @@ A directory is simply a file whose decrypted contents enumerate named entries an
 }
 ```
 
-This directory blob is encrypted and stored identically to file inodes-same block size, same encryption, same erasure coding. From a server's perspective, all blobs are indistinguishable.
+This directory blob is encrypted and stored identically to file inodes: same block size, same encryption, same erasure coding. From a server's perspective, all blobs are indistinguishable.
 
 Entry names are stored within the encrypted blob, invisible to servers. An observer cannot determine how many files exist, what they are named, or how the directory tree is structured. They see only a collection of uniform encrypted blocks.
 
 ### 8.2 Merkle DAG Structure
 
-The directory hierarchy forms a Merkle Directed Acyclic Graph (DAG). Each node-whether file inode or directory-is identified by the content hash of its encrypted representation. Parent nodes contain the hashes of their children.
+The directory hierarchy forms a Merkle Directed Acyclic Graph (DAG). Each node, whether file inode or directory, is identified by the content hash of its encrypted representation. Parent nodes contain the hashes of their children.
 
 ```
                     ┌─────────────────┐
@@ -452,7 +487,7 @@ The directory hierarchy forms a Merkle Directed Acyclic Graph (DAG). Each node-w
     └───────────────┘ └───────────────┘
 ```
 
-This structure provides several important properties. Any node's hash authenticates its entire subtree-if an attacker modifies any descendant, the hashes will not match during traversal. The structure can be verified incrementally; a client can validate a path from root to a specific file without fetching the entire tree. Unchanged subtrees share storage; updating one file doesn't require re-uploading siblings.
+This structure provides several important properties. Any node's hash authenticates its entire subtree: if an attacker modifies any descendant, the hashes will not match during traversal. The structure can be verified incrementally; a client can validate a path from root to a specific file without fetching the entire tree. Unchanged subtrees share storage; updating one file doesn't require re-uploading siblings.
 
 ### 8.3 Path Resolution
 
@@ -525,7 +560,7 @@ Creating a new commit follows this sequence:
 6. Create a commit event with `prev` pointing to the fetched head
 7. Sign and publish the commit event to Nostr relays
 
-If step 2 reveals that the local state diverges from the chain head-because another device committed in the interim-the client must reconcile before proceeding. Reconciliation strategies include:
+If step 2 reveals that the local state diverges from the chain head because another device committed in the interim, the client must reconcile before proceeding. Reconciliation strategies include:
 
 - **Abort**: Discard local changes, fetch remote state, let user redo changes
 - **Merge**: If changes affect disjoint subtrees, automatically merge
@@ -535,7 +570,7 @@ The appropriate strategy depends on the application. For personal backup, aborti
 
 ### 9.3 Snapshot-Based Workflow
 
-The hash chain naturally supports an explicit save model rather than continuous synchronization. Users accumulate changes locally-adding files, modifying documents, reorganizing directories-without network activity. These changes exist only on the local device.
+The hash chain naturally supports an explicit save model rather than continuous synchronization. Users accumulate changes locally (adding files, modifying documents, reorganizing directories) without network activity. These changes exist only on the local device.
 
 When the user explicitly saves (clicks a button, invokes a command), the client:
 
@@ -545,7 +580,7 @@ When the user explicitly saves (clicks a button, invokes a command), the client:
 
 This batching reduces network traffic, avoids intermediate states, and gives users clear checkpoints. The resulting history shows meaningful snapshots ("Added tax documents for 2024") rather than a stream of micro-changes.
 
-Between saves, the local state may be lost if the device fails. This is acceptable for a backup-oriented system-unsaved changes are analogous to unsaved edits in a document editor. Users who want continuous protection should save frequently.
+Between saves, the local state may be lost if the device fails. This is acceptable for a backup-oriented system: unsaved changes are analogous to unsaved edits in a document editor. Users who want continuous protection should save frequently.
 
 ### 9.4 Chain Traversal and History
 
@@ -557,7 +592,7 @@ HEAD ──prev──► Commit N-1 ──prev──► Commit N-2 ──prev─
 
 Clients can implement time-travel functionality: given any historical commit, they can reconstruct the exact filesystem state at that point by using the commit's root hash to traverse the Merkle DAG.
 
-This history has storage implications. Old commits reference old blobs which must be retained for history to remain valid. Users who don't need history can garbage collect aggressively. Users who value history must retain more data. Section 14 discusses garbage collection in detail.
+This history has storage implications. Old commits reference old blobs which must be retained for history to remain valid. Users who don't need history can garbage collect aggressively. Users who value history must retain more data. Section 13 discusses garbage collection in detail.
 
 ### 9.5 Head Discovery and Chain Traversal
 
@@ -571,7 +606,7 @@ Nostr relays return events in reverse chronological order by `created_at` timest
 REQ: ["REQ", <sub_id>, {"kinds": [1097], "authors": [<pubkey>], "limit": 1}]
 ```
 
-The relay returns the most recent commit event. In normal operation—where commits are created sequentially from a single device or with proper conflict resolution—this is the chain head.
+The relay returns the most recent commit event. In normal operation, where commits are created sequentially from a single device or with proper conflict resolution, this is the chain head.
 
 For robustness, clients should verify the result by checking that no other commit references this event as its `prev`. If multiple devices commit simultaneously, the most recent by timestamp wins; the other becomes a fork requiring reconciliation.
 
@@ -588,7 +623,7 @@ This traversal reconstructs the complete history without requiring any decryptio
 
 #### Fork Detection
 
-Forks occur when two commits share the same `prev` value—both claim to follow the same parent. During traversal:
+Forks occur when two commits share the same `prev` value, meaning both claim to follow the same parent. During traversal:
 
 1. If multiple events have the same `prev`, a fork exists
 2. The event with the later `created_at` timestamp is the canonical head
@@ -617,20 +652,21 @@ The `prev` tag reveals chain structure but not contents. Observers can count com
 
 ### 10.1 Recovery Process
 
-Disaster recovery requires only the owner's Nostr secret key (nsec). No backup files, no secondary credentials, no trusted third party. The recovery process:
+Disaster recovery requires the owner's Nostr secret key (nsec) and passphrase (empty string if none was set). No backup files, no secondary credentials, no trusted third party. The recovery process:
 
-1. **Derive public key**: Compute npub from nsec using secp256k1
-2. **Discover relays**: Query the user's relay list (NIP-65 outbox model) or use known relays
-3. **Derive master key**: Compute master storage key from nsec via HKDF
-4. **Find chain head**: Query relays for kind 1097 events with author = npub and limit = 1; the most recent commit by `created_at` is the head
-5. **Decrypt commit**: Decrypt the head commit's content field using the commit key derived from master key
-6. **Fetch root**: Download k shares of the root directory inode using URLs from the commit
-7. **Decode and decrypt**: Erasure-decode and decrypt the root directory
-8. **Traverse**: Recursively fetch any desired files through the directory structure
+1. **Derive storage identity**: Combine nsec + passphrase to derive storage nsec (Section 6.4)
+2. **Derive storage npub**: Compute public key from storage nsec using secp256k1
+3. **Discover relays**: Query the user's relay list (NIP-65 outbox model) or use known relays
+4. **Derive master key**: Compute master storage key from storage nsec via HKDF
+5. **Find chain head**: Query relays for kind 1097 events with author = storage npub and limit = 1; the most recent commit by `created_at` is the head
+6. **Decrypt commit**: Decrypt the head commit's content field using the commit key derived from master key
+7. **Fetch root**: Download k shares of the root directory inode using URLs from the commit
+8. **Decode and decrypt**: Erasure-decode and decrypt the root directory
+9. **Traverse**: Recursively fetch any desired files through the directory structure
 
 For full history recovery, omit the limit parameter in step 4, fetch all commits, and traverse the chain via `prev` tags as described in Section 9.5.
 
-The Nostr relay network serves as the discovery layer. Relays are interchangeable—the client can query any relay that might have stored the owner's events. Since events are signed, their authenticity is verifiable regardless of which relay provides them.
+The Nostr relay network serves as the discovery layer. Relays are interchangeable: the client can query any relay that might have stored the owner's events. Since events are signed, their authenticity is verifiable regardless of which relay provides them.
 
 ### 10.2 Relay Selection
 
@@ -658,169 +694,11 @@ If insufficient shares remain available for any blob, that blob is unrecoverable
 
 ---
 
-## 11. Passphrase-Protected Storage Identities
+## 11. Transport Layer
 
-### 11.1 Motivation
+### 11.1 Blossom Protocol
 
-The base design derives all keys from the user's Nostr secret key (nsec). This provides convenient single-key recovery but creates a single point of compromise: an attacker who obtains the nsec gains complete access to all stored data, past and present.
-
-This section describes an optional extension that derives a separate storage identity from the combination of an nsec and a passphrase. The derived identity is itself a valid Nostr keypair, used transparently throughout the system. This approach requires no changes to the core protocol—it simply changes what nsec is used.
-
-### 11.2 Design Goals
-
-The passphrase extension provides several properties:
-
-**Defense in depth**: Compromise of the nsec alone reveals nothing. The attacker must also obtain the passphrase to derive the storage identity.
-
-**Plausible deniability**: Different passphrases derive different storage identities, each with independent data. There is no cryptographic evidence that additional passphrases exist. A user under duress can reveal a decoy passphrase while keeping sensitive data hidden.
-
-**Multiple independent stores**: A single nsec can manage multiple completely separate storage buckets—one per passphrase. These buckets share no keys, no data, and no visible relationship.
-
-**Implementation simplicity**: The passphrase is processed once at the entry point to derive a storage nsec. All subsequent operations use this derived nsec exactly as the base protocol specifies. No other code paths change.
-
-### 11.3 Cryptographic Primitive Selection
-
-The derivation uses only cryptographic primitives already present in the Nostr ecosystem:
-
-| Primitive | Usage | Already Used In |
-|-----------|-------|-----------------|
-| HMAC-SHA256 | PRF for PBKDF2 | NIP-44 |
-| PBKDF2 | Passphrase stretching | BIP-39 |
-| SHA-256 | Hashing | Event IDs, content addressing |
-| secp256k1 | Derived keypair | All Nostr signatures |
-
-This design intentionally avoids introducing new primitives such as Argon2 or BLAKE2, even though they offer stronger properties. The rationale:
-
-1. **Reduced attack surface**: Fewer cryptographic assumptions to audit
-2. **Implementation availability**: Every Nostr client already has these primitives
-3. **Ecosystem consistency**: Matches patterns established by BIP-39 and NIP-44
-4. **Hardware wallet compatibility**: PBKDF2 is available on constrained devices
-
-The tradeoff is reduced resistance to GPU-based attacks compared to memory-hard functions. This is acceptable given the compensating factors discussed in Section 11.7.
-
-### 11.4 Key Derivation Specification
-
-The storage nsec is derived from the user's nsec and passphrase as follows:
-
-```
-function derive_storage_nsec(nsec: bytes[32], passphrase: string) -> bytes[32]:
-
-    // Step 1: Create identity-bound salt
-    // This prevents rainbow tables across different users
-    salt = HMAC-SHA256(
-        key = "garland-v1-salt",
-        message = nsec
-    )
-
-    // Step 2: Stretch passphrase with PBKDF2
-    // Empty string is valid (the "no passphrase" case)
-    stretched = PBKDF2-HMAC-SHA256(
-        passphrase = UTF8(passphrase),
-        salt = salt,
-        iterations = 210000,
-        output_length = 32
-    )
-
-    // Step 3: Combine nsec and stretched passphrase
-    derived_nsec = HMAC-SHA256(
-        key = "garland-v1-nsec",
-        message = nsec || stretched
-    )
-
-    return derived_nsec
-```
-
-The derived output is used directly as a secp256k1 private key. The probability of producing an invalid scalar (zero or ≥ curve order) is approximately 2⁻¹²⁸, which is negligible. Implementations may optionally reduce modulo the curve order for defense in depth.
-
-### 11.5 The Empty Passphrase
-
-When no passphrase is provided, the empty string is used:
-
-```
-storage_nsec = derive_storage_nsec(user_nsec, "")
-```
-
-This is not a special case—the derivation runs identically with `passphrase = ""`. The result is a deterministic storage identity derived from the nsec alone.
-
-The empty-passphrase identity serves as the default or "decoy" storage bucket. Users who never set a passphrase still benefit from the derived identity model, maintaining a clean separation between their social Nostr identity and their storage identity.
-
-### 11.6 Multiple Storage Buckets
-
-Each distinct passphrase produces a distinct storage identity:
-
-```
-nsec + ""           →  npub_A  →  Storage bucket A (default/decoy)
-nsec + "personal"   →  npub_B  →  Storage bucket B
-nsec + "work"       →  npub_C  →  Storage bucket C
-nsec + "sensitive"  →  npub_D  →  Storage bucket D
-```
-
-Each bucket is completely independent:
-
-- **Different keypairs**: Each has its own npub, visible on relays
-- **Separate commit chains**: No `prev` links between buckets
-- **Independent servers**: Can use different Blossom servers
-- **No cryptographic linkage**: Observing npub_A reveals nothing about npub_B
-
-This enables compartmentalized storage where compromise of one passphrase does not affect others.
-
-### 11.7 Security Analysis
-
-With nsec alone, an attacker can access the empty-passphrase bucket but cannot determine if other buckets exist. Finding additional buckets requires brute-forcing passphrases through PBKDF2 (210,000 iterations per guess). At ~10,000 GPU guesses/second, a passphrase with 80+ bits of entropy remains computationally infeasible to crack.
-
-Under duress, revealing a decoy passphrase provides plausible deniability—there is no cryptographic evidence that other buckets exist. Weak passphrases remain vulnerable to dictionary attacks; high-security buckets require strong passphrases.
-
-Side-channel correlation (timing, IP addresses, relay patterns) can link derived identities. Users requiring strong compartmentalization should access different buckets through different network paths.
-
-### 11.8 Design Rationale
-
-The derived-identity approach was chosen over alternatives:
-
-- **Key-hierarchy-only** (same npub, different encryption keys): Weaker deniability since commits remain discoverable; requires protocol changes.
-- **Argon2**: Stronger GPU resistance but introduces BLAKE2b, a primitive not used elsewhere in Nostr.
-- **Higher iterations**: Possible but trades usability; 210,000 aligns with OWASP 2023 recommendations.
-
-### 11.9 Implementation Notes
-
-**Iteration count**: The value 210,000 is based on OWASP 2023 guidelines for PBKDF2-HMAC-SHA256. This should be reviewed periodically and increased as hardware improves.
-
-**Passphrase encoding**: Passphrases are encoded as UTF-8 before processing. Implementations should normalize Unicode (NFC recommended) to ensure consistent derivation across platforms.
-
-**Caching**: The derived nsec should be cached in memory for the session duration to avoid repeated PBKDF2 computation. It should never be written to persistent storage.
-
-**UI guidance**: Applications should clearly indicate which storage bucket is active and warn users about the implications of passphrase loss. There is no recovery mechanism—a forgotten passphrase means permanent loss of that bucket's data.
-
-### 11.10 Recovery with Passphrase
-
-The recovery process (Section 10.1) is modified as follows:
-
-1. **Obtain credentials**: User provides nsec and passphrase (empty string if none)
-2. **Derive storage nsec**: Apply the derivation function from Section 11.4
-3. **Derive storage npub**: Compute public key from derived nsec
-4. **Query relays**: Request kind 1097 events with author = storage npub
-5. **Continue as normal**: Decrypt commits, fetch root, traverse structure
-
-The only change is steps 1-3: deriving the storage identity before querying relays. All subsequent operations are identical to the base protocol.
-
-### 11.11 Trade-offs Summary
-
-| Benefit | Cost |
-|---------|------|
-| nsec compromise does not expose data | Must remember passphrase |
-| Plausible deniability | Passphrase change requires full re-publish |
-| Multiple independent stores | Cannot prove ownership across stores |
-| No protocol changes | Storage identity ≠ social identity |
-| Uses existing primitives | Less GPU-resistant than Argon2 |
-
-This extension is optional. Users who prefer single-key simplicity can use the empty passphrase exclusively, treating the derived identity as their sole storage identity. Users who require defense in depth or deniability can leverage multiple passphrases to compartmentalize their data.
-
----
-
-## 12. Transport Layer
-
-### 12.1 Blossom Protocol
-
-Blossom servers provide content-addressed blob storage over HTTP, authenticated via Nostr events. The protocol is intentionally minimal-servers store bytes and retrieve bytes, nothing more.
+Blossom servers provide content-addressed blob storage over HTTP. The protocol is intentionally minimal: servers store bytes and retrieve bytes, nothing more.
 
 Core endpoints:
 
@@ -834,35 +712,64 @@ Core endpoints:
 
 The `{sha256}` path component is the lowercase hex-encoded SHA-256 hash of the blob's contents. An optional file extension may be appended (e.g., `/{sha256}.pdf`) for MIME type hinting, but servers identify blobs solely by hash.
 
-### 12.2 Authentication
+### 11.2 Authentication
 
-Write operations (PUT, DELETE) require authentication via a Nostr event included in the Authorization header:
+Some servers require authentication for write operations (PUT, DELETE) via a Nostr event in the Authorization header. Other servers operate openly without authentication.
+
+#### Per-Blob Authentication Keys
+
+Using a single pubkey for all uploads allows servers to correlate blobs to the same owner, undermining privacy. To prevent this, the default authentication mode derives a unique keypair for each blob:
+
+```
+blob_auth_privkey = HKDF-SHA256(
+    IKM = master_key,
+    salt = "blob-auth-v1",
+    info = share_id,
+    length = 32
+)
+blob_auth_pubkey = secp256k1_pubkey(blob_auth_privkey)
+```
+
+The share_id (SHA-256 hash of the blob) is already stored in the inode, so no additional data is needed. The same key can be regenerated for deletion.
+
+When authentication is required:
 
 ```
 Authorization: Nostr <base64-encoded-event>
 ```
 
-The authorization event has kind 24242 and must include:
+The authorization event has kind 24242:
 
 ```json
 {
   "kind": 24242,
+  "pubkey": "<per-blob derived pubkey>",
   "created_at": 1701907200,
   "tags": [
     ["t", "upload"],
     ["x", "<sha256 of blob being uploaded>"],
     ["expiration", "1701910800"]
   ],
-  "content": "Uploading backup data",
-  "sig": "<signature>"
+  "content": "",
+  "sig": "<signature from per-blob key>"
 }
 ```
 
-The `t` tag specifies the authorized action: "upload", "delete", or "list". The `x` tag binds the authorization to a specific blob hash, preventing replay attacks. The `expiration` tag limits the authorization's validity window.
+The `t` tag specifies the authorized action: "upload" or "delete". The `x` tag binds the authorization to a specific blob hash. The `expiration` tag limits the authorization's validity window.
 
-Servers verify the signature, confirm the kind is 24242, check that the action matches the `t` tag, validate that the current time is before expiration, and for uploads/deletes, verify the `x` tag matches the blob hash.
+With per-blob keys, each blob appears to come from a different user. Servers cannot correlate blobs by pubkey, cannot determine total storage per user, and cannot link uploads across time.
 
-### 12.3 Server Responses
+#### Identity Key Mode
+
+For servers requiring a billing relationship or account management, users may opt into identity key mode, where all authorizations use the storage identity pubkey directly. This enables per-user quotas and billing but allows the server to correlate all blobs to the same owner.
+
+Identity key mode is selected per-server in client configuration. Users should prefer per-blob keys for privacy-focused servers and identity keys only where billing integration requires it.
+
+#### Server Verification
+
+Servers verify the signature, confirm the kind is 24242, check that the action matches the `t` tag, validate that the current time is before expiration, and verify the `x` tag matches the blob hash. Servers do not need to know which authentication mode the client uses; they simply verify valid signatures.
+
+### 11.3 Server Responses
 
 Successful upload returns a blob descriptor:
 
@@ -888,7 +795,7 @@ X-Content-Sha256: abc123def456...
 
 HEAD requests return the same headers without the body, enabling existence checks without downloading content.
 
-### 12.4 Server Interchangeability
+### 11.4 Server Interchangeability
 
 Blossom servers are interchangeable and fungible. A blob uploaded to server A can be retrieved from server B if server B also has it. The content hash serves as a universal identifier across all servers.
 
@@ -903,24 +810,24 @@ The system's erasure coding distributes shares across servers, so migration requ
 
 ---
 
-## 13. Verification and Repair
+## 12. Verification and Repair
 
-### 13.1 The Verification Service
+### 12.1 The Verification Service
 
 Data durability requires ongoing verification that shares remain available across storage servers. This verification can be performed by the client application directly, or delegated to a separate steward service that runs independently.
 
-A steward is a process—potentially running on a dedicated server, a home machine, or a cloud instance—that:
+A steward is a process (potentially running on a dedicated server, a home machine, or a cloud instance) that:
 
 1. Periodically reads the owner's current state from the commit chain
 2. Challenges each share location to verify data availability
 3. Detects failures and initiates repair when shares become unavailable
 4. Updates the commit chain with new share locations after repair
 
-The steward requires sufficient credentials to perform these operations. In the simplest model, it holds the owner's nsec (or derived storage nsec if using passphrase protection). More sophisticated deployments might use delegated keys with limited authority—sufficient to read manifests and upload replacement shares, but unable to delete data or modify directory structure.
+The steward requires sufficient credentials to perform these operations. In the simplest model, it holds the owner's nsec (or derived storage nsec if using passphrase protection). More sophisticated deployments might use delegated keys with limited authority, sufficient to read manifests and upload replacement shares but unable to delete data or modify directory structure.
 
 The verification frequency depends on the user's durability requirements and tolerance for data loss. Weekly verification catches most server failures before they cascade. Daily verification provides stronger guarantees at higher bandwidth cost. Users with critical data might verify continuously, while archival users might verify monthly.
 
-### 13.2 Verification Approaches
+### 12.2 Verification Approaches
 
 Several approaches exist for verifying share availability, each with different tradeoffs between simplicity, bandwidth, privacy, and integrity guarantees.
 
@@ -936,10 +843,10 @@ If the server returns 200 OK, the share exists. If it returns 404 Not Found, the
 
 | Aspect | Assessment |
 |--------|------------|
-| Bandwidth | Minimal—only HTTP headers exchanged |
-| Privacy | Poor—servers observe exactly which shares are being verified and when |
-| Integrity | None—confirms existence but not correctness; a server could return 200 for corrupted data |
-| Implementation | Trivial—standard HTTP |
+| Bandwidth | Minimal: only HTTP headers exchanged |
+| Privacy | Poor: servers observe exactly which shares are being verified and when |
+| Integrity | None: confirms existence but not correctness; a server could return 200 for corrupted data |
+| Implementation | Trivial: standard HTTP |
 
 This approach suits low-threat environments where servers are trusted not to serve corrupted data and privacy from servers is not a concern.
 
@@ -956,10 +863,10 @@ The verifier selects a random byte range, requests those bytes, and compares the
 
 | Aspect | Assessment |
 |--------|------------|
-| Bandwidth | Moderate—downloads partial share data; configurable via range size |
-| Privacy | Poor—servers observe which shares are accessed |
-| Integrity | Strong—verifies actual content, not just metadata; random sampling makes undetected corruption probabilistically unlikely |
-| Implementation | Moderate—requires local storage of shares or ability to reconstruct them |
+| Bandwidth | Moderate: downloads partial share data; configurable via range size |
+| Privacy | Poor: servers observe which shares are accessed |
+| Integrity | Strong: verifies actual content, not just metadata; random sampling makes undetected corruption probabilistically unlikely |
+| Implementation | Moderate: requires local storage of shares or ability to reconstruct them |
 
 For complete integrity verification, the entire share can be downloaded and hashed:
 
@@ -982,9 +889,9 @@ Client checks: share_hash ∈ filter?
 
 | Aspect | Assessment |
 |--------|------------|
-| Bandwidth | Low—download filter once, check many blobs locally |
-| Privacy | Good—server cannot determine which blobs client is verifying |
-| Integrity | None—confirms server claims to have the blob; does not verify content |
+| Bandwidth | Low: download filter once, check many blobs locally |
+| Privacy | Good: server cannot determine which blobs client is verifying |
+| Integrity | None: confirms server claims to have the blob; does not verify content |
 | Implementation | Requires server support; filter format must be standardized |
 
 This approach can be combined with selective content verification: use filters for routine existence checks, then perform byte-range verification on a random sample or when filters indicate potential issues.
@@ -1000,7 +907,7 @@ A practical deployment might combine approaches:
 
 This balances bandwidth, privacy, and integrity while catching most failure modes.
 
-### 13.3 Repair Flow
+### 12.3 Repair Flow
 
 When verification detects that share i of block b is unavailable or corrupted:
 
@@ -1022,64 +929,74 @@ When verification detects that share i of block b is unavailable or corrupted:
 
 9. **Commit**: Publish a new commit event with the updated root, referencing the previous commit.
 
-Repair is expensive—it requires downloading k full shares (potentially hundreds of kilobytes each) and uploading at least one new share. However, repair occurs only on failure, and early detection prevents cascading failures that could make blocks unrecoverable.
+**Local file optimization**: If the client has the original file locally, steps 2-3 can be skipped entirely. Re-encrypt the local block with the same file key and block index (producing identical ciphertext), then re-encode to generate the missing share. This avoids downloading k shares over the network and is significantly faster.
 
-### 13.4 Steward Authority Models
+Repair from remote shares is expensive: it requires downloading k full shares (potentially hundreds of kilobytes each) and uploading at least one new share. However, repair occurs only on failure, and early detection prevents cascading failures that could make blocks unrecoverable.
 
-The authority granted to a steward determines what operations it can perform autonomously versus what requires user intervention.
+### 12.4 Steward Authority
 
-**Full authority**: The steward holds the owner's nsec and can perform any operation—verification, repair, and even deletion or restructuring. This model is simple but provides no protection if the steward is compromised.
+Currently, a steward requires the full storage nsec to perform repairs. Both Blossom uploads (kind 24242 authorization) and commit events (kind 1097) require signatures from the storage keypair. There is no mechanism for delegated or restricted authority with current Nostr primitives.
 
-**Repair-only authority**: The steward holds a delegated key or capability token that allows:
-- Reading commit events and decrypting manifests
-- Downloading shares for verification
-- Uploading new shares to servers
-- Publishing repair commits (new root with updated share locations)
-
-But does not allow:
-- Deleting shares from servers
-- Modifying directory structure
-- Garbage collection
-
-This limits damage from steward compromise to storage cost (uploading junk) rather than data loss.
-
-**Read-only authority**: The steward can only verify and report. It alerts the user to failures but cannot initiate repair. The user must manually authorize each repair operation. This provides maximum control at the cost of availability—if the user is unavailable when repair is needed, data may become unrecoverable.
-
-The appropriate model depends on the user's threat model, availability requirements, and operational capacity.
+This means steward compromise is equivalent to full account compromise. Users must weigh the availability benefits of automated repair against the risk of key exposure. See Section 17.2 for discussion of potential protocol extensions enabling fine-grained delegation.
 
 ---
 
-## 14. Garbage Collection
+## 13. Garbage Collection
 
-### 14.1 The Accumulation Problem
+### 13.1 The Accumulation Problem
 
 Content-addressed immutable storage naturally accumulates data. Updating a file creates new blobs; the old blobs persist. The directory structure uses copy-on-write semantics, so modifying a deeply nested file creates new blobs for every ancestor directory up to the root. Without cleanup, storage consumption grows monotonically even if the logical dataset size remains constant.
 
 This design places garbage collection responsibility entirely with the client. The system does not automatically delete anything. Users must explicitly choose to delete obsolete data, accepting the tradeoff between storage costs and history preservation.
 
-### 14.2 Reference Tracking
+### 13.2 Reference Tracking
 
 The client maintains knowledge of which blobs are reachable from each commit. A blob is garbage if it's unreachable from any commit the user wishes to preserve.
 
-Computing reachability requires traversing the Merkle DAG from each preserved commit's root. For a given set of root hashes, reachable blobs are:
+Computing reachability requires traversing the Merkle DAG from each preserved commit's root. The traversal must handle each blob type appropriately:
+
+**Directory blobs**: Extract `entries[i].hash` for each entry; these are content hashes of child inodes. Also collect the directory blob's own share IDs (from the parent's reference to it).
+
+**File inodes**: Extract `blocks[i].shares[j].id` for all shares of all blocks; these are the share hashes stored on servers. Also collect the inode blob's own share IDs. Note that the `blocks[i].hash` field is a plaintext integrity hash, not a server-stored blob.
+
+**Large file inodes**: Extract `block_index_chunks[i].shares[j].id` for all indirect block shares, then traverse each indirect block to collect the actual content share IDs within.
+
+**Indirect block chunks**: Extract `blocks[i].shares[j].id` for all content shares referenced by this chunk.
 
 ```
-reachable = {}
-for root in preserved_roots:
-    traverse(root, reachable)
+reachable_shares = {}
 
-def traverse(hash, reachable):
-    if hash in reachable:
-        return
-    reachable.add(hash)
-    blob = fetch_and_decrypt(hash)
-    for child_hash in extract_references(blob):
-        traverse(child_hash, reachable)
+def traverse_from_commit(commit):
+    root_inode_shares = commit.root_inode.shares
+    for share in root_inode_shares:
+        reachable_shares.add(share.id)
+    traverse_inode(fetch_and_decrypt(root_inode_shares))
+
+def traverse_inode(inode):
+    if inode.type == "directory":
+        for entry in inode.entries:
+            for share in entry.shares:
+                reachable_shares.add(share.id)
+            child = fetch_and_decrypt(entry.shares)
+            traverse_inode(child)
+    elif inode.type == "file":
+        if inode.blocks:  # direct blocks
+            for block in inode.blocks:
+                for share in block.shares:
+                    reachable_shares.add(share.id)
+        if inode.block_index_chunks:  # large file indirect blocks
+            for chunk in inode.block_index_chunks:
+                for share in chunk.shares:
+                    reachable_shares.add(share.id)
+                indirect = fetch_and_decrypt(chunk.shares)
+                for block in indirect.blocks:
+                    for share in block.shares:
+                        reachable_shares.add(share.id)
 ```
 
-Blobs not in the reachable set are candidates for deletion.
+Shares not in `reachable_shares` are candidates for deletion. This includes old file content, old inodes, and old directory blobs from previous versions.
 
-### 14.3 Deletion Strategies
+### 13.3 Deletion Strategies
 
 Several strategies for garbage collection exist, offering different tradeoffs:
 
@@ -1091,7 +1008,7 @@ Several strategies for garbage collection exist, offering different tradeoffs:
 
 **Explicit snapshots**: Mark specific commits as preserved (e.g., monthly snapshots, pre-migration backups). Delete blobs unreachable from any preserved commit.
 
-### 14.4 Deletion Process
+### 13.4 Deletion Process
 
 To delete a garbage blob, all n shares must be deleted from their respective servers. Partial deletion leaves the blob reconstructable from surviving shares.
 
@@ -1104,7 +1021,7 @@ To delete garbage blobs:
    - Send DELETE request with authorization
 4. Publish a commit with the `garbage` field listing the deleted blob hashes
 
-The commit's `garbage` field serves as an announcement of intent. It signals to future clients examining history that these blobs were deliberately deleted and should not be considered missing or corrupted. Note that these hashes, while encrypted within the commit, could theoretically be correlated by an adversary who previously observed blob uploads—though this requires both passive observation of uploads and access to decrypted commits.
+The commit's `garbage` field serves as an announcement of intent. It signals to future clients examining history that these blobs were deliberately deleted and should not be considered missing or corrupted. Note that these hashes, while encrypted within the commit, could theoretically be correlated by an adversary who previously observed blob uploads, though this requires both passive observation of uploads and access to decrypted commits.
 
 Deletion authorization uses the same Nostr event mechanism as uploads:
 
@@ -1121,7 +1038,7 @@ Deletion authorization uses the same Nostr event mechanism as uploads:
 }
 ```
 
-### 14.5 Metadata Event Garbage Collection
+### 13.5 Metadata Event Garbage Collection
 
 The hash chain of commit events also accumulates over time. Old commit events may be pruned from relays to reduce storage, but this requires care.
 
@@ -1135,33 +1052,36 @@ In practice, commit events are small (kilobytes) and relay storage is cheap. Mos
 
 ---
 
-## 15. What Servers Observe
+## 14. What Servers Observe
 
 Understanding what information storage servers can and cannot learn is essential for evaluating the system's privacy properties. This section consolidates the privacy analysis from the server's perspective.
 
-### 15.1 What Blossom Servers Observe
+### 14.1 What Blossom Servers Observe
 
 From any individual Blossom server's perspective:
 
 **Observable:**
 - Fixed-size encrypted blobs, all identical in size
 - The SHA-256 hash of each blob (used as identifier)
-- The public key that uploaded each blob (from authorization events)
+- A unique public key per blob (from per-blob authentication, see Section 11.2)
 - Timestamps of upload, access, and deletion requests
 - IP addresses and access patterns for requests
-- Total storage consumed by each public key
 
 **Not observable:**
 - Whether a blob contains file data, directory metadata, or an inode
 - Original file names, types, or sizes
 - Relationships between blobs (which blobs belong to the same file)
+- Which blobs belong to the same user (per-blob keys prevent correlation)
 - Directory structure or hierarchy depth
 - Which blobs are currently "live" versus orphaned from garbage collection
 - The plaintext content of any blob
+- Total storage per user (each blob has a unique pubkey)
 
 The uniformity of blob sizes is critical. Without it, servers could infer file types from characteristic sizes, correlate related blobs by timing and size patterns, or distinguish small configuration files from chunks of large media files. With uniform sizing, a 100-byte text file produces the same 256 KiB blob as any chunk of a multi-gigabyte video.
 
-### 15.2 What Nostr Relays Observe
+Per-blob authentication keys complement uniform sizing: even if a server stores thousands of blobs from one user, it cannot determine they share an owner. Each blob appears to come from a different user. Users who opt into identity key mode (Section 11.2) for billing purposes sacrifice this property on those servers.
+
+### 14.2 What Nostr Relays Observe
 
 Relays storing commit events observe:
 
@@ -1182,7 +1102,7 @@ Relays storing commit events observe:
 
 The `prev` tag reveals that commits form a chain but not what the chain contains. An observer can count commits and analyze timing but cannot determine whether a commit added one file or a thousand, or whether it deleted data via garbage collection.
 
-### 15.3 Cross-Server Correlation
+### 14.3 Cross-Server Correlation
 
 An adversary controlling multiple servers or observing network traffic might attempt correlation:
 
@@ -1196,36 +1116,42 @@ An adversary controlling multiple servers or observing network traffic might att
 - Use different network paths (Tor, VPN rotation) for different servers
 - Avoid predictable verification schedules
 
+**Block reassembly**: If k or more servers collude, they can combine their shares to reconstruct encrypted blocks. However, without the user's key, reassembled blocks remain encrypted and reveal nothing about content. The adversary gains the ability to verify that shares belong together and to detect block-level changes over time, but learns nothing about what the blocks contain.
+
 Even with correlation, the adversary learns only about activity patterns, not content. They might infer "user X added data at time T" but not "user X uploaded family photos."
 
-### 15.4 Information Leak Summary
+### 14.4 Information Leak Summary
 
 | Information | Leaked To | Mitigation |
 |-------------|-----------|------------|
-| Total storage volume | Each Blossom server | Inherent; use more servers to fragment |
+| Total blob count | Colluding servers | Inherent; use more servers to fragment |
 | Activity timing | Servers and relays | Random delays, batching |
-| Public key identity | Servers and relays | Derived storage identities (Section 11) |
+| Storage identity | Relays only | Per-blob keys prevent server correlation |
 | Number of commits | Relays | Batch changes into fewer commits |
 | IP address | Servers and relays | Tor, VPN, proxy rotation |
 
-The system prioritizes content privacy over metadata privacy. What you store is completely hidden; that you store something and roughly how much is observable. Users requiring metadata privacy should employ network-level anonymization.
+With per-blob authentication keys, individual Blossom servers cannot determine per-user storage volume. Only colluding servers that combine timing analysis can attempt to correlate blobs, and even then, the link is probabilistic rather than cryptographic.
+
+The system prioritizes content privacy over metadata privacy. What you store is completely hidden; that you store something is partially observable through timing and IP correlation. Users requiring metadata privacy should employ network-level anonymization.
 
 ---
 
-## 16. Lifecycle Summary
+## 15. Lifecycle Summary
 
-### 16.1 Initial Setup
+### 15.1 Initial Setup
 
 A new user performs one-time setup:
 
 1. Generate or import a Nostr keypair (nsec/npub)
-2. Derive the master storage key from nsec
-3. Configure preferred Blossom servers
-4. Configure preferred Nostr relays
-5. Create an empty root directory
-6. Publish the genesis commit event
+2. Choose a passphrase (empty string for default bucket)
+3. Derive storage nsec from nsec + passphrase (Section 6.4)
+4. Derive master storage key from storage nsec
+5. Configure preferred Blossom servers
+6. Configure preferred Nostr relays
+7. Create an empty root directory
+8. Publish the genesis commit event
 
-### 16.2 Adding Files
+### 15.2 Adding Files
 
 To add a file to the storage system:
 
@@ -1243,7 +1169,7 @@ To add a file to the storage system:
 8. Recursively update ancestors to the root
 9. Stage changes for the next commit
 
-### 16.3 Committing Changes
+### 15.3 Committing Changes
 
 When the user saves:
 
@@ -1254,7 +1180,7 @@ When the user saves:
 5. Sign and publish commit to relays
 6. Clear local staged changes
 
-### 16.4 Reading Files
+### 15.4 Reading Files
 
 To read a file by path:
 
@@ -1268,14 +1194,14 @@ To read a file by path:
 5. Concatenate blocks and remove padding
 6. Return file contents
 
-### 16.5 Verification and Repair
+### 15.5 Verification and Repair
 
 Periodically, the client should verify data availability:
 
 1. For each blob referenced by the current state:
    - For each share of that blob:
-     - Send HEAD request to check existence
-     - Optionally, GET and verify hash matches
+     - Check existence via HEAD request, server fuse filters, or byte range request
+     - Optionally, download and verify full hash matches
 2. If any blob has fewer than k available shares:
    - Fetch k surviving shares
    - Erasure-decode to recover the block
@@ -1284,7 +1210,7 @@ Periodically, the client should verify data availability:
    - Update inode with new share locations
    - Commit the updated inodes
 
-### 16.6 Garbage Collection
+### 15.6 Garbage Collection
 
 When storage costs warrant cleanup:
 
@@ -1297,9 +1223,9 @@ When storage costs warrant cleanup:
 
 ---
 
-## 17. Security Analysis
+## 16. Security Analysis
 
-### 17.1 Confidentiality
+### 16.1 Confidentiality
 
 Storage servers observe only uniformly-sized encrypted blobs. They cannot determine:
 
@@ -1310,27 +1236,27 @@ Storage servers observe only uniformly-sized encrypted blobs. They cannot determ
 - Directory structure (directories are encrypted like files)
 - Relationships between blobs (no plaintext linking)
 
-The encryption is semantic-identical plaintexts produce different ciphertexts due to random per-file keys. Servers cannot detect when users store the same content.
+The encryption is semantically secure: identical plaintexts produce different ciphertexts due to random per-file keys. Servers cannot detect when users store the same content.
 
-### 17.2 Integrity
+### 16.2 Integrity
 
-Content addressing provides integrity at multiple levels. Share hashes verify individual share integrity. Block hashes (stored in inodes) verify decrypted block integrity. The Merkle DAG structure verifies structural integrity-any modification to any blob changes the root hash.
+Content addressing provides integrity at multiple levels. Share hashes verify individual share integrity. Block hashes (stored in inodes) verify decrypted block integrity. The Merkle DAG structure verifies structural integrity: any modification to any blob changes the root hash.
 
 Content addressing detects ciphertext tampering. If an attacker modifies stored data, the SHA-256 hash will not match the share ID, and the data will be rejected before decryption is attempted.
 
-### 17.3 Availability
+### 16.3 Availability
 
 Erasure coding ensures availability despite server failures. With (n, k) parameters, data survives the loss of any n - k servers. The hash chain ensures commit history survives relay churn as long as at least one relay retains the events.
 
 The system does not provide availability against censorship or targeted attacks where adversaries deliberately destroy more than n - k shares simultaneously.
 
-### 17.4 Authentication
+### 16.4 Authentication
 
 Nostr signatures authenticate all state changes. Only the holder of the nsec can publish valid commit events. Blossom authorization events prevent unauthorized uploads or deletions.
 
 Relays and servers can verify signature validity but cannot forge signatures. A compromised relay could refuse to serve events (availability attack) but cannot produce fake commits (integrity preserved).
 
-### 17.5 Key Compromise
+### 16.5 Key Compromise
 
 If the nsec is compromised, all security properties fail. The attacker can:
 
@@ -1343,39 +1269,45 @@ Key management is outside this system's scope. Users should employ standard prac
 
 ---
 
-## 18. Future Considerations
+## 17. Future Considerations
 
-### 18.1 Payment Integration
+### 17.1 Payment Integration
 
 Storage servers require compensation for resources consumed. Integration with payment systems would enable sustainable server operation.
 
-Possibilities include per-byte pricing with Lightning Network micropayments, subscription models with ecash or traditional payment, and storage markets where servers compete on price and reliability. Payment integration should not compromise privacy-payments should not link to specific blobs or reveal access patterns.
+Possibilities include per-byte pricing with Lightning Network micropayments, subscription models with ecash or traditional payment, and storage markets where servers compete on price and reliability. Payment integration should not compromise privacy: payments should not link to specific blobs or reveal access patterns.
 
-### 18.2 Steward Services
+### 17.2 Delegated Steward Authority
 
-A steward service could handle verification and repair automatically, running continuously without user intervention. This requires delegating sufficient authority to perform repairs without granting full account access.
+Fine-grained steward permissions would require protocol extensions not currently available in Nostr/Blossom:
 
-Potential approaches include capability tokens authorizing specific repair actions, or read-only access combined with user approval for repairs. Steward design involves complex trust tradeoffs and is deferred to future work.
+**Blossom capability tokens**: Servers could accept upload authorization from a delegated key pre-authorized by the owner. The owner signs a capability grant: "pubkey X may upload blobs on my behalf until time T". Servers verify the grant chain rather than requiring direct owner signatures.
 
-### 18.3 Multi-Device Synchronization
+**Repair-only commit events**: A new event kind for repair commits, signed by a steward key that the owner has authorized via a delegation event. These commits could only modify share URLs, not directory structure or content.
+
+**Separated key hierarchy**: Derive a "repair key" from the master key that can decrypt manifests and re-encode shares, but cannot access file content encryption keys. This limits what a compromised steward can read.
+
+These extensions would enable a steward that can verify and repair without being able to read file contents, delete data, or modify structure, limiting compromise impact to storage cost rather than data loss.
+
+### 17.3 Multi-Device Synchronization
 
 The current design supports multiple devices through the commit chain, but conflict resolution is minimal. Enhanced multi-device support might include automatic merging for non-conflicting changes, three-way merge for file-level conflicts, operational transformation for collaborative editing, and CRDT-based structures for specific data types.
 
-### 18.4 Deduplication
+### 17.4 Deduplication
 
-Content addressing naturally deduplicates identical files-they hash to the same blob. Block-level deduplication across files is more complex. Content-defined chunking using rolling hashes (Rabin fingerprinting) could identify common blocks across similar files, reducing storage for versioned documents or near-duplicates.
+Content addressing naturally deduplicates identical files since they hash to the same blob. Block-level deduplication across files is more complex. Content-defined chunking using rolling hashes (Rabin fingerprinting) could identify common blocks across similar files, reducing storage for versioned documents or near-duplicates.
 
-### 18.5 Proof of Retrievability
+### 17.5 Proof of Retrievability
 
 More sophisticated cryptographic proofs could enable efficient verification without downloading data. Proof of Retrievability (PoR) schemes allow servers to prove they hold data by responding to challenges. This could reduce verification bandwidth from O(data size) to O(security parameter).
 
 ---
 
-## 19. Conclusion
+## 18. Conclusion
 
 This design provides a practical architecture for durable, private, personal storage built on existing Nostr and Blossom infrastructure. The layered architecture separates concerns: fixed-size blocks provide privacy through uniformity, erasure coding provides durability through redundancy, encryption provides confidentiality, content addressing provides integrity, the Merkle DAG provides efficient updates and verification, and the hash chain provides auditable history with conflict detection.
 
-The system achieves its core requirements. Durability is provided through erasure coding-data survives arbitrary server failures up to the configured threshold. Privacy is comprehensive-storage providers learn nothing about content, sizes, structure, or access patterns beyond gross storage volume. Sovereignty is preserved-users control when changes commit and when old data is deleted. Recoverability is complete-the entire dataset and its history can be reconstructed from a single secret key.
+The system achieves its core requirements. Durability is provided through erasure coding: data survives arbitrary server failures up to the configured threshold. Privacy is comprehensive: storage providers learn nothing about content, sizes, structure, or access patterns beyond gross storage volume. Sovereignty is preserved: users control when changes commit and when old data is deleted. Recoverability is complete: the entire dataset and its history can be reconstructed from a single secret key.
 
 The reliance on immutable, content-addressed blobs simplifies consistency and enables straightforward caching. The explicit save model gives users clear checkpoints and avoids the complexity of real-time synchronization. The hash chain provides history, auditability, and conflict detection without requiring trusted timestamps or consensus.
 
