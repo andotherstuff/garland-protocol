@@ -183,6 +183,18 @@ The n shares contain the evaluations of P(x) at n distinct points. Using systema
 
 In practice, encoding multiplies the source vector by a k × n generator matrix (typically derived from a Vandermonde or Cauchy matrix, chosen for their guaranteed invertibility properties). The computational cost is modest: encoding a 256 KiB block completes in milliseconds.
 
+**Block size constraint**: The block size B MUST be chosen such that B is evenly divisible by k. If the implementation uses a fixed block size that may not divide evenly for all k values, blocks MUST be padded to the next multiple of k bytes before splitting. Recommended (B, k) pairs for 256 KiB nominal block size:
+
+| k | B (bytes) | B/k (bytes per share) |
+|---|-----------|----------------------|
+| 2 | 262,144 | 131,072 |
+| 3 | 261,120 (255 KiB) | 87,040 |
+| 4 | 262,144 | 65,536 |
+| 5 | 262,140 | 52,428 |
+| 6 | 262,144 | 43,690 + 4 bytes padding |
+
+Implementations SHOULD select B to divide evenly by k. When this is impractical, padding the block to the next multiple of k before encoding is acceptable.
+
 ### 5.3 Decoding Process
 
 Erasure decoding exploits the key property that erasure locations are known: we know which servers failed, we simply don't have their data. This differs from error correction, where corrupted symbols must first be identified.
@@ -343,10 +355,12 @@ The derivation uses only primitives present in the Nostr ecosystem (HMAC-SHA256,
 **Multiple buckets**: Each passphrase produces a distinct storage identity with independent keys, commit chain, and data:
 
 ```
-nsec + ""         →  npub_A  →  Storage bucket A (default)
-nsec + "personal" →  npub_B  →  Storage bucket B
-nsec + "work"     →  npub_C  →  Storage bucket C
+nsec + ""                          →  npub_A  →  Storage bucket A (default)
+nsec + "correct horse battery"     →  npub_B  →  Storage bucket B
+nsec + "abandon abandon abandon"   →  npub_C  →  Storage bucket C
 ```
+
+Passphrases should have sufficient entropy to resist brute-force attacks. While PBKDF2 slows down guessing, it cannot compensate for low-entropy passphrases. Short dictionary words like "work" or "photos" are easily guessable. Use multiple random words or a strong generated passphrase.
 
 There is no cryptographic linkage between buckets. An attacker with the nsec can access the empty-passphrase bucket but cannot determine if others exist (plausible deniability). Finding additional buckets requires brute-forcing passphrases through 210,000 PBKDF2 iterations per guess.
 
@@ -800,16 +814,27 @@ HEAD requests return the same headers without the body, enabling existence check
 
 ### 11.4 Server Interchangeability
 
-Blossom servers are interchangeable and fungible. A blob uploaded to server A can be retrieved from server B if server B also has it. The content hash serves as a universal identifier across all servers.
+Blossom servers are interchangeable in that any server can store and serve any blob by its content hash. However, inodes explicitly bind specific server URLs for each share:
 
-This interchangeability enables several patterns:
+```json
+{
+  "shares": [
+    {"id": "<share0_hash>", "server": "https://blossom1.example.com"},
+    {"id": "<share1_hash>", "server": "https://blossom2.example.com"}
+  ]
+}
+```
 
-- **Mirroring**: Upload the same blob to multiple servers for redundancy
-- **Migration**: Move from one server to another by re-uploading
-- **CDN integration**: Servers can replicate blobs to edge locations
-- **Opportunistic caching**: Clients can check multiple servers and use whichever responds fastest
+Clients fetch shares from these listed servers. There is no automatic discovery mechanism for finding alternative servers that may also host a given share.
 
-The system's erasure coding distributes shares across servers, so migration requires uploading only shares to replacement servers, not the full reconstructed blob.
+In practice, "interchangeability" means:
+
+- **Flexible fetching**: Clients can choose which k of n listed servers to fetch from
+- **Repair via replacement**: Failed servers can be replaced by uploading shares to new servers and updating the inode
+- **Migration**: Move from one server to another by re-uploading shares and updating references
+- **CDN integration**: Servers can replicate blobs to edge locations transparently
+
+The system does not include automatic discovery of alternative servers hosting a given share.
 
 ---
 
@@ -1298,7 +1323,9 @@ The current design supports multiple devices through the commit chain, but confl
 
 ### 17.4 Deduplication
 
-Content addressing naturally deduplicates identical files since they hash to the same blob. Block-level deduplication across files is more complex. Content-defined chunking using rolling hashes (Rabin fingerprinting) could identify common blocks across similar files, reducing storage for versioned documents or near-duplicates.
+The current design prioritizes semantic security over deduplication. Random per-file keys ensure identical plaintexts produce different ciphertexts, preventing servers from detecting duplicate content—both across users and within a single user's storage. Deduplication is not supported.
+
+Future designs could explore deterministic encryption schemes that enable deduplication while preserving some privacy properties, or content-defined chunking using rolling hashes (Rabin fingerprinting) to identify common blocks across similar files. However, these approaches involve privacy tradeoffs not addressed in this specification.
 
 ### 17.5 Proof of Retrievability
 
