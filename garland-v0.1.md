@@ -373,7 +373,7 @@ plaintext = ChaCha20(block_key, nonce, ciphertext)
 
 File inodes and directory entries contain sensitive metadata: filenames, sizes, timestamps, and structural relationships. The client encrypts this metadata using the metadata key derived from the master key, with the same authenticated encryption scheme as file blocks.
 
-When storing an inode or directory, the client:
+When storing a single-block inode or directory, the client:
 1. Serializes the structure to JSON
 2. Pads to the plaintext capacity C (B - 44 bytes) with random bytes
 3. Generates a random 12-byte nonce
@@ -382,9 +382,8 @@ When storing an inode or directory, the client:
 6. Prepends nonce and appends MAC to form B-byte encrypted block
 7. Erasure-codes the encrypted block into n shares
 8. Uploads shares to n servers
-9. Stores the nonce in the parent reference (see Section 7 and 8)
 
-The nonce for each metadata blob is stored in the parent structure that references it. For file inodes, the nonce is stored in the directory entry. For directories, the nonce is stored in the parent directory entry. For the root directory, the nonce is stored in the commit event.
+The nonce is embedded in the encrypted block (identical to file content blocks), not stored separately in the parent reference. To decrypt, the client fetches the shares, reconstructs the block, extracts the nonce from the first 12 bytes, verifies the MAC, and decrypts.
 
 The resulting shares are indistinguishable from file data shares. See Section 14 for detailed privacy analysis.
 
@@ -475,27 +474,56 @@ The `shares` array is ordered by share index (0 to n-1). The array position dete
 
 The client stores inodes as blobs using the same pipeline: serialize, pad, encrypt, erasure-code, and distribute. The resulting structure's content hash forms a node in the Merkle DAG.
 
-### 7.1 Large File Inodes
+### 7.1 Large Inodes
 
-Files with many blocks may produce inodes exceeding the standard block size. With (n=5, k=3) erasure coding, each block entry requires approximately 500 bytes for share IDs and server URLs. A file with 500,000 blocks would generate a ~250 MB inode, far exceeding the 256 KiB block limit.
+Any inode (file or directory) may exceed the plaintext capacity C when serialized. With (n=5, k=3) erasure coding, each block entry requires approximately 500 bytes for share IDs and server URLs. A file with 500,000 blocks or a directory with thousands of entries could exceed the block size limit.
 
-For files exceeding approximately 500 blocks, the inode uses an indirect block structure:
+When an inode exceeds C bytes, it is stored as multiple blocks using the same mechanism as file content:
+
+1. Serialize the inode to JSON
+2. Split into blocks of C bytes (padding the final block)
+3. Encrypt each block with a key derived from a single `inode_id`
+4. Erasure-code and upload each encrypted block
+5. The parent reference includes the `inode_id` and block list
+
+A multi-block inode reference in a directory entry:
 
 ```json
 {
-  "version": 1,
-  "type": "file",
-  "size": 137438953472,
-  "indirect": true,
-  "block_index": [
-    {"hash": "<content hash of block index chunk 0>", "shares": [...]},
-    {"hash": "<content hash of block index chunk 1>", "shares": [...]}
-  ],
-  "erasure": {"algorithm": "reed-solomon", "k": 2, "n": 3}
+  "photos": {
+    "type": "directory",
+    "inode_id": "<base64-encoded 32-byte random identifier>",
+    "blocks": [
+      {
+        "index": 0,
+        "hash": "<SHA-256 of plaintext block>",
+        "shares": [
+          {"id": "<share0_sha256>", "server": "https://blossom1.example.com"},
+          {"id": "<share1_sha256>", "server": "https://blossom2.example.com"}
+        ]
+      },
+      {
+        "index": 1,
+        "hash": "<SHA-256 of plaintext block>",
+        "shares": [...]
+      }
+    ]
+  }
 }
 ```
 
-Each block index chunk contains an array of block entries, stored as a separate encrypted blob. This bounds inode size regardless of file size, at the cost of one additional fetch per block index chunk during file access.
+The `inode_id` serves the same purpose as `file_id` for file content, enabling deterministic key derivation for multi-block data:
+
+```
+inode_key = HKDF-Expand(metadata_key, "garland-v1:inode:" || inode_id, 32)
+block_key = HKDF-Expand(inode_key, "garland-v1:block:" || block_index_as_u64_be, 32)
+```
+
+Each block is then encrypted with ChaCha20 + HMAC-SHA256 using a random nonce, identical to file content blocks.
+
+For single-block inodes (the common case), the inode is encrypted directly with `metadata_key` and the nonce is embedded in the encrypted block (same format as file content blocks). Implementations should use this simpler approach when the serialized inode fits in one block.
+
+This unified approach means the same chunking mechanism handles large files, large directories, and any future large metadata. Implementations use one code path for all cases.
 
 ---
 
@@ -515,23 +543,26 @@ A directory is simply a file whose decrypted contents enumerate named entries an
     "photos": {
       "type": "directory",
       "inode": "<content hash of photos directory inode blob>",
-      "nonce": "<base64-encoded 12-byte nonce for decrypting the inode>"
+      "shares": [
+        {"id": "<share0_sha256>", "server": "https://blossom1.example.com"},
+        {"id": "<share1_sha256>", "server": "https://blossom2.example.com"}
+      ]
     },
     "documents": {
       "type": "directory",
       "inode": "<content hash of documents directory inode blob>",
-      "nonce": "<base64-encoded 12-byte nonce>"
+      "shares": [...]
     },
     "notes.txt": {
       "type": "file",
       "inode": "<content hash of notes.txt inode blob>",
-      "nonce": "<base64-encoded 12-byte nonce>"
+      "shares": [...]
     }
   }
 }
 ```
 
-Each entry includes the `nonce` used to encrypt the referenced inode. This nonce is required to decrypt the inode after fetching its shares. The nonce is stored in the parent directory rather than embedded in the encrypted blob, allowing the same metadata encryption key to be used for all inodes while ensuring unique (key, nonce) pairs.
+Each entry contains the content hash and share locations for the referenced inode. The `inode` field is the SHA-256 hash of the encrypted inode blob (used for integrity verification). The `shares` array lists where to fetch the erasure-coded shares.
 
 The client encrypts and stores directory blobs identically to file inodes: same block size, same authenticated encryption, same erasure coding. Entry names remain within the encrypted blob, invisible to servers.
 
@@ -593,18 +624,15 @@ A commit event has the following structure:
   "kind": 1097,
   "pubkey": "<owner's public key>",
   "created_at": 1701907200,
-  "tags": [
-    ["prev", "<event ID of previous commit>"],
-    ["nonce", "<base64-encoded 12-byte random nonce>"]
-  ],
+  "tags": [],
   "content": "<encrypted payload>",
   "sig": "<Schnorr signature>"
 }
 ```
 
-The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The genesis commit omits this tag. The `nonce` tag contains the random nonce used to encrypt the content field. The `created_at` timestamp provides temporal ordering; Nostr relays serve events in reverse chronological order by default, enabling efficient head discovery (see Section 9.5).
+The commit event has no tags. All metadata is encrypted within the content field. The `created_at` timestamp provides temporal ordering; Nostr relays serve events in reverse chronological order by default, enabling retrieval of recent commits.
 
-The client encrypts the `content` field using ChaCha20 with the commit key and the nonce from the tag, followed by HMAC-SHA256 authentication:
+The client encrypts the `content` field using ChaCha20 with the commit key and a random nonce, followed by HMAC-SHA256 authentication:
 
 ```
 nonce = random_bytes(12)
@@ -613,13 +641,15 @@ mac = HMAC-SHA256(commit_key, nonce || ciphertext)
 content = base64(nonce || ciphertext || mac)
 ```
 
+The nonce is prepended to the ciphertext within the base64-encoded content, not stored in a tag.
+
 The decrypted content contains:
 
 ```json
 {
+  "prev": "<event ID of previous commit, or null for genesis>",
   "root_inode": {
     "hash": "<content hash of root directory inode>",
-    "nonce": "<base64-encoded 12-byte nonce for decrypting root inode>",
     "shares": [
       {"id": "<share_hash>", "server": "https://blossom1.example.com"},
       {"id": "<share_hash>", "server": "https://blossom2.example.com"},
@@ -632,7 +662,9 @@ The decrypted content contains:
 }
 ```
 
-The `root_inode` field contains the content hash, decryption nonce, and share locations for the root directory blob. The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted from storage servers. The optional `message` field allows human-readable commit descriptions.
+The `prev` field contains the event ID of the immediately preceding commit, creating the chain. The genesis commit sets `prev` to null. Encrypting `prev` hides the commit chain structure from observers, who see only that commits exist but not how they link together.
+
+The `root_inode` field contains the content hash and share locations for the root directory blob. The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted from storage servers. The optional `message` field allows human-readable commit descriptions.
 
 ### 9.2 Commit Process
 
@@ -670,7 +702,7 @@ Between saves, the local state may be lost if the device fails. This is acceptab
 
 ### 9.4 Chain Traversal and History
 
-The complete history is recoverable by walking the chain backward from the head. Each commit's `prev` tag leads to its predecessor until reaching the genesis commit, which omits the `prev` tag entirely.
+The complete history is recoverable by walking the chain backward from the head. Each commit's `prev` field (within the encrypted content) leads to its predecessor until reaching the genesis commit (which has `prev: null`).
 
 ```
 HEAD ──prev──► Commit N-1 ──prev──► Commit N-2 ──prev──► ... ──prev──► Genesis
@@ -701,11 +733,16 @@ If different relays return different "most recent" events (due to propagation de
 For disaster recovery or history reconstruction, clients traverse the complete chain:
 
 1. Query for all kind 1097 events by the owner's pubkey (no limit)
-2. Build an index: `event_id → event` and `prev → event_id`
-3. Identify the head: the event whose ID appears in no other event's `prev` tag
-4. Walk backward via `prev` tags until reaching genesis (the commit with no `prev` tag)
+2. Decrypt each commit's content to extract its `prev` field
+3. Build an index: `event_id → event` and `prev → event_id`
+4. Identify the head: the event whose ID appears in no other event's `prev` field
+5. Walk backward via `prev` fields until reaching genesis (the commit with `prev: null`)
 
-This traversal reconstructs the complete history without requiring any decryption. The chain structure is visible in plaintext `prev` tags; only the content (root hashes, garbage lists, messages) requires decryption.
+Since `prev` is encrypted, chain traversal requires decrypting all commits. This is acceptable because:
+- Commits are small (a few hundred bytes each)
+- Decryption is fast (ChaCha20 + HMAC verification)
+- Commits must be decrypted anyway to access their content
+- The privacy benefit (hiding chain structure) outweighs the cost
 
 #### Fork Detection
 
@@ -719,18 +756,19 @@ For personal single-device usage, forks are rare. Multi-device deployments shoul
 
 ### 9.6 Metadata Privacy
 
-Commit events are publicly visible on relays. To minimize metadata leakage, sensitive fields are encrypted within the `content` field:
+Commit events are publicly visible on relays. To minimize metadata leakage, all fields except those required by Nostr are encrypted within the `content` field:
 
-- **Root hash**: Stored only in encrypted content. Observers cannot detect when the filesystem changes or correlate commits with blob uploads.
-- **Garbage list**: Stored only in encrypted content. Observers cannot determine when data is being deleted.
-- **Commit message**: Stored only in encrypted content.
+- **Prev pointer**: Encrypted. Observers cannot see how commits link together.
+- **Root hash**: Encrypted. Observers cannot detect when the filesystem changes or correlate commits with blob uploads.
+- **Garbage list**: Encrypted. Observers cannot determine when data is being deleted.
+- **Commit message**: Encrypted.
 
 The only plaintext metadata exposed is:
-- The `prev` tag linking to the parent commit (necessary for chain traversal)
 - The `created_at` timestamp (required by Nostr protocol)
 - The owner's public key (inherent to Nostr signatures)
+- The existence of commits (event count reveals activity frequency)
 
-The `prev` tag reveals chain structure but not contents. Observers can count commits and analyze timing patterns from `created_at` timestamps, but cannot determine what changed between commits or how much data each commit affects. Users concerned about timing analysis can batch commits or add random delays to `created_at` values (within Nostr's tolerance for clock skew).
+Observers can count commits and analyze timing patterns from `created_at` timestamps, but cannot determine what changed between commits, how much data each commit affects, or how commits relate to each other. Users concerned about timing analysis can batch commits or add random delays to `created_at` values (within Nostr's tolerance for clock skew).
 
 ---
 
@@ -750,7 +788,7 @@ Disaster recovery requires the owner's Nostr secret key (nsec) and passphrase (e
 8. **Decode and decrypt**: Erasure-decode and decrypt the root directory
 9. **Traverse**: Recursively fetch any desired files through the directory structure
 
-For full history recovery, omit the limit parameter in step 4, fetch all commits, and traverse the chain via `prev` tags as described in Section 9.5.
+For full history recovery, omit the limit parameter in step 4, fetch all commits, and traverse the chain via encrypted `prev` fields as described in Section 9.5.
 
 The Nostr relay network serves as the discovery layer. Relays are interchangeable: the client can query any relay that might have stored the owner's events. Since events are signed, their authenticity is verifiable regardless of which relay provides them.
 
@@ -1053,50 +1091,76 @@ This design places garbage collection responsibility entirely with the client. T
 
 The client maintains knowledge of which blobs are reachable from each commit. A blob is garbage if it's unreachable from any commit the user wishes to preserve.
 
-Computing reachability requires traversing the Merkle DAG from each preserved commit's root. The traversal must handle each blob type appropriately:
+Computing reachability requires traversing the Merkle DAG from each preserved commit's root. The traversal handles all blob types uniformly:
 
-**Directory blobs**: Extract `entries[i].hash` for each entry; these are content hashes of child inodes. Also collect the directory blob's own share IDs (from the parent's reference to it).
+**Inode references**: Each reference (in directory entries or commit content) may be single-block (has `inode` or `hash` field plus `shares`) or multi-block (has `inode_id` and `blocks` array). Collect all share IDs from the reference, then fetch and decrypt to traverse the inode's contents.
 
-**File inodes**: Extract `blocks[i].shares[j].id` for all shares of all blocks; these are the share hashes stored on servers. Also collect the inode blob's own share IDs. Note that the `blocks[i].hash` field is a plaintext integrity hash, not a server-stored blob.
+**File inodes**: Extract `blocks[i].shares[j].id` for all file content shares.
 
-**Large file inodes**: Extract `block_index_chunks[i].shares[j].id` for all indirect block shares, then traverse each indirect block to collect the actual content share IDs within.
-
-**Indirect block chunks**: Extract `blocks[i].shares[j].id` for all content shares referenced by this chunk.
+**Directory inodes**: For each entry, collect its inode reference shares, then recursively traverse the child inode.
 
 ```
 reachable_shares = {}
 
+def collect_inode_ref_shares(ref):
+    """Collect shares from a single-block or multi-block inode reference."""
+    if ref.blocks:  # multi-block inode
+        for block in ref.blocks:
+            for share in block.shares:
+                reachable_shares.add(share.id)
+    else:  # single-block inode (has shares directly)
+        for share in ref.shares:
+            reachable_shares.add(share.id)
+
 def traverse_from_commit(commit):
-    root_inode_shares = commit.root_inode.shares
-    for share in root_inode_shares:
-        reachable_shares.add(share.id)
-    traverse_inode(fetch_and_decrypt(root_inode_shares))
+    collect_inode_ref_shares(commit.root_inode)
+    root = fetch_and_decrypt(commit.root_inode)
+    traverse_inode(root)
 
 def traverse_inode(inode):
     if inode.type == "directory":
-        for entry in inode.entries:
-            for share in entry.shares:
-                reachable_shares.add(share.id)
-            child = fetch_and_decrypt(entry.shares)
+        for entry in inode.entries.values():
+            collect_inode_ref_shares(entry)
+            child = fetch_and_decrypt(entry)
             traverse_inode(child)
     elif inode.type == "file":
-        if inode.blocks:  # direct blocks
-            for block in inode.blocks:
-                for share in block.shares:
-                    reachable_shares.add(share.id)
-        if inode.block_index_chunks:  # large file indirect blocks
-            for chunk in inode.block_index_chunks:
-                for share in chunk.shares:
-                    reachable_shares.add(share.id)
-                indirect = fetch_and_decrypt(chunk.shares)
-                for block in indirect.blocks:
-                    for share in block.shares:
-                        reachable_shares.add(share.id)
+        for block in inode.blocks:
+            for share in block.shares:
+                reachable_shares.add(share.id)
 ```
 
 Shares not in `reachable_shares` are candidates for deletion. This includes old file content, old inodes, and old directory blobs from previous versions.
 
-### 13.3 Deletion Strategies
+### 13.3 Incremental Garbage Collection
+
+The `garbage` array in each commit (Section 9.1) lists blobs that became unreachable at that commit. This enables incremental collection without full DAG traversal:
+
+```
+def incremental_gc(oldest_commit_to_discard, oldest_commit_to_keep):
+    """Delete garbage from commits between discard and keep boundaries."""
+    commit = oldest_commit_to_discard
+    while commit != oldest_commit_to_keep:
+        for blob_hash in commit.garbage:
+            delete_all_shares(blob_hash)
+        commit = next_commit(commit)  # follow chain forward
+```
+
+**Algorithm:**
+
+1. Walk the commit chain forward from the oldest commit you wish to discard
+2. At each commit, delete the blobs listed in its `garbage` array
+3. Continue until reaching the oldest commit you wish to retain
+4. Optionally delete the commit events themselves from relays
+
+This approach:
+- Requires no DAG traversal or client-side reachability computation
+- Each commit already records exactly what it obsoletes
+- Works incrementally as new commits are created
+- Deletes garbage in the order it was created
+
+**Example**: To keep only the last 30 days of history, find commits older than 30 days and walk forward through them, deleting each commit's garbage list. Stop at the 30-day boundary.
+
+### 13.4 Retention Strategies
 
 Several strategies for garbage collection exist, offering different tradeoffs:
 
@@ -1108,7 +1172,7 @@ Several strategies for garbage collection exist, offering different tradeoffs:
 
 **Explicit snapshots**: Mark specific commits as preserved (e.g., monthly snapshots, pre-migration backups). Delete blobs unreachable from any preserved commit.
 
-### 13.4 Deletion Process
+### 13.5 Deletion Process
 
 To delete a garbage blob, all n shares must be deleted from their respective servers. Partial deletion leaves the blob reconstructable from surviving shares.
 
@@ -1138,7 +1202,7 @@ Deletion authorization uses the same Nostr event mechanism as uploads:
 }
 ```
 
-### 13.5 Metadata Event Garbage Collection
+### 13.6 Metadata Event Garbage Collection
 
 The hash chain of commit events also accumulates over time. Old commit events may be pruned from relays to reduce storage, but this requires care.
 
@@ -1188,19 +1252,20 @@ Relays storing commit events observe:
 **Observable:**
 - The public key publishing commits (owner identity or derived storage identity)
 - The `created_at` timestamp of each commit
-- The `prev` tag linking commits into a chain
 - The encrypted `content` field (opaque ciphertext)
 - The total number of commits over time
 - Timing patterns of commit activity
 
 **Not observable:**
+- The `prev` pointer linking commits (encrypted in content)
 - The root hash or any blob references (encrypted in content)
 - Commit messages (encrypted in content)
 - Garbage collection lists (encrypted in content)
 - What changed between commits
 - Dataset size or structure
+- How commits relate to each other (chain structure hidden)
 
-The `prev` tag reveals that commits form a chain but not what the chain contains. An observer can count commits and analyze timing but cannot determine whether a commit added one file or a thousand, or whether it deleted data via garbage collection.
+Observers can count commits and analyze timing but cannot determine whether a commit added one file or a thousand, whether it deleted data via garbage collection, or how commits link together.
 
 ### 14.3 Cross-Server Correlation
 
@@ -1257,13 +1322,13 @@ To add a file to the storage system:
 
 1. Read the file content
 2. Divide into fixed-size blocks with padding
-3. Generate a random per-file encryption key
+3. Generate a random file_id and derive the file encryption key
 4. For each block:
    - Derive the block encryption key
-   - Encrypt with ChaCha20
+   - Encrypt with ChaCha20 + HMAC-SHA256
    - Erasure-code into n shares
    - Upload shares to n servers
-5. Construct the inode with block metadata
+5. Construct the inode with file_id and block metadata
 6. Encrypt and upload the inode blob
 7. Update the parent directory to include the new entry
 8. Recursively update ancestors to the root
@@ -1336,7 +1401,7 @@ Storage servers observe only uniformly-sized encrypted blobs. They cannot determ
 - Directory structure (directories are encrypted like files)
 - Relationships between blobs (no plaintext linking)
 
-The encryption is semantically secure: identical plaintexts produce different ciphertexts due to random per-file keys. Servers cannot detect when users store the same content.
+The encryption is semantically secure: identical plaintexts produce different ciphertexts due to random per-file keys and random nonces. Servers cannot detect when users store the same content.
 
 ### 16.2 Integrity
 
