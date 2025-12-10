@@ -111,22 +111,25 @@ When reading a file, the client traverses from the current chain head through th
 
 ### 4.1 Fixed-Size Blocks
 
-All data entering the system is divided into fixed-size blocks before any cryptographic processing. The block size B is a system parameter, typically 256 KiB (262,144 bytes), though implementations may support alternative sizes for specific use cases.
+All data entering the system is divided into fixed-size blocks before any cryptographic processing. The block size B is a system parameter, typically 256 KiB (262,144 bytes), though implementations may support alternative sizes for specific use cases. B refers to the final encrypted block size; the plaintext capacity per block is `B - 44` bytes to accommodate the 12-byte nonce and 32-byte MAC (see Section 6.2).
 
-For a file of size S bytes, the number of blocks is:
-
-```
-N_blocks = ⌈S / B⌉
-```
-
-The final block is padded to exactly B bytes using a length-prefixed padding scheme. Only the final block includes a length prefix: the first four bytes encode the actual content length as a big-endian 32-bit unsigned integer, followed by the content bytes, followed by zero bytes to fill the block:
+For a file of size S bytes, the plaintext capacity C = B - 44, and the number of blocks is:
 
 ```
-Non-final blocks: [content: B bytes]
-Final block:      [content_length: u32_be][content: content_length bytes][padding: zeros]
+C = B - 44  (plaintext capacity per block)
+N_blocks = ⌈S / C⌉
 ```
 
-This scheme enables unambiguous removal of padding during reconstruction. For the final block, content_length contains `S mod B`. A value of 0 indicates the final block is completely full, meaning the file size is an exact multiple of B. Non-final blocks contain exactly B bytes of content with no overhead.
+The final block is padded to exactly C bytes using a length-prefixed padding scheme. Only the final block includes a length prefix: the first four bytes encode the actual content length as a big-endian 32-bit unsigned integer, followed by the content bytes, followed by random padding bytes to fill the block:
+
+```
+Non-final blocks: [content: C bytes]
+Final block:      [content_length: u32_be][content: content_length bytes][padding: random bytes to C total]
+```
+
+This scheme enables unambiguous removal of padding during reconstruction. For the final block, content_length contains `S mod C`. A value of 0 indicates the final block is completely full, meaning the file size is an exact multiple of C. Non-final blocks contain exactly C bytes of content with no overhead.
+
+The padding bytes MUST be randomly generated, not zeros. Random padding avoids known-plaintext at predictable locations within blocks. Since the padding is discarded during reconstruction (the decoder uses content_length to determine where content ends), the random bytes need not be reproducible.
 
 ### 4.2 Privacy Through Uniformity
 
@@ -253,7 +256,7 @@ nsec + passphrase (empty string default)
               │
               ├─► Per-Blob Auth Key (HKDF-Expand with share_id, see Section 11.2)
               │
-              └─► Per-File Key (random, stored encrypted in inode)
+              └─► Per-File Key (HKDF-Expand with file_id)
                     │
                     └─► Per-Block Key (HKDF-Expand with block index)
 ```
@@ -289,9 +292,20 @@ metadata_key = HKDF-Expand(
 
 The commit key encrypts commit event content. The metadata key encrypts inodes and directory blobs. Separating these keys limits the impact of potential key compromise and clarifies the encryption scope.
 
-Each file receives a randomly generated 256-bit key at creation time. This per-file key is stored within the file's inode, encrypted with the metadata key. Random per-file keys ensure that identical files produce different ciphertexts, preventing content-based correlation.
+Each file receives a randomly generated 256-bit `file_id` at creation time. This identifier is stored in plaintext within the inode and used to derive the file's encryption key:
 
-**File modification**: When a file is modified, the client creates a new inode with a freshly generated random file_key. The file_key is never reused across file versions. This is essential because the encryption uses a fixed zero nonce; reusing a file_key for different content would cause keystream reuse, enabling trivial plaintext recovery.
+```
+file_id = random_bytes(32)  # generated at file creation, stored in inode
+file_key = HKDF-Expand(
+    PRK = master_key,
+    info = "garland-v1:file:" || file_id,
+    length = 32
+)
+```
+
+This derivation provides cryptographic separation between metadata and content. An attacker who compromises `metadata_key` can decrypt inodes and learn file structure (names, sizes, timestamps), but cannot derive `file_key` without `master_key`. The `file_id` in plaintext is meaningless without `master_key`.
+
+**File modification**: When a file is modified, the client creates a new inode with a freshly generated `file_id`. This ensures each file version uses a unique `file_key`, preventing key reuse across versions.
 
 Per-block keys are derived from the file key:
 
@@ -305,30 +319,58 @@ block_key = HKDF-Expand(
 
 ### 6.2 Encryption
 
-Each block is encrypted using ChaCha20, a stream cipher widely used in the Nostr ecosystem (NIP-44) and well-supported across platforms.
+Each block is encrypted using ChaCha20 with HMAC-SHA256 authentication, following a construction similar to NIP-44. This provides both confidentiality and authentication.
 
 The encryption process for block i with file key K_f:
 
 ```
 block_key = HKDF-Expand(K_f, "garland-v1:block:" || i, 32)
-nonce = 0x000000000000000000000000  (12 zero bytes)
+nonce = random_bytes(12)
 ciphertext = ChaCha20(block_key, nonce, plaintext_block)
+mac = HMAC-SHA256(block_key, nonce || ciphertext)
+encrypted_block = nonce || ciphertext || mac
 ```
 
-Since each block uses a unique derived key, a fixed zero nonce is cryptographically safe: the (key, nonce) pair is never reused. This avoids 12 bytes of overhead per block.
+The encrypted block format is:
 
-Integrity is provided by the content-addressing scheme. Each share is stored and retrieved by its SHA-256 hash, and if a server returns data that doesn't match the requested hash, it is rejected. After decryption, the plaintext block hash is verified against the value stored in the inode. This layered integrity checking at the storage layer makes encryption-layer authentication unnecessary.
+```
+[nonce: 12 bytes][ciphertext: B - 44 bytes][mac: 32 bytes]
+```
+
+The block size B (typically 256 KiB) refers to the total encrypted block size, ensuring uniform blob sizes for privacy. The plaintext capacity per block is `B - 44` bytes (262,100 bytes for B = 256 KiB). This 44-byte overhead (12-byte nonce + 32-byte MAC) is 0.017% of the block size.
+
+**Random nonces**: Each block uses a freshly generated random nonce, providing defense-in-depth against implementation bugs that might cause key reuse. Even though per-block keys are unique, random nonces add a safety margin.
+
+**Authentication**: The HMAC authenticates both the nonce and ciphertext, detecting tampering before decryption. During decryption, the client first verifies the MAC; if verification fails, decryption does not proceed. This complements the content-addressing integrity (which verifies after decryption) by catching corruption earlier.
+
+**Decryption process**:
+
+```
+nonce = encrypted_block[0:12]
+ciphertext = encrypted_block[12:-32]
+mac = encrypted_block[-32:]
+expected_mac = HMAC-SHA256(block_key, nonce || ciphertext)
+if not constant_time_compare(mac, expected_mac):
+    reject("authentication failed")
+plaintext = ChaCha20(block_key, nonce, ciphertext)
+```
 
 ### 6.3 Metadata Encryption
 
-File inodes and directory entries contain sensitive metadata: filenames, sizes, timestamps, and structural relationships. The client encrypts this metadata using the metadata key derived from the master key.
+File inodes and directory entries contain sensitive metadata: filenames, sizes, timestamps, and structural relationships. The client encrypts this metadata using the metadata key derived from the master key, with the same authenticated encryption scheme as file blocks.
 
 When storing an inode or directory, the client:
 1. Serializes the structure to JSON
-2. Pads to the fixed block size (256 KiB)
-3. Encrypts using ChaCha20 with the metadata key
-4. Erasure-codes the encrypted block into n shares
-5. Uploads shares to n servers
+2. Pads to the plaintext capacity C (B - 44 bytes) with random bytes
+3. Generates a random 12-byte nonce
+4. Encrypts using ChaCha20 with the metadata key and nonce
+5. Computes HMAC-SHA256 over nonce || ciphertext
+6. Prepends nonce and appends MAC to form B-byte encrypted block
+7. Erasure-codes the encrypted block into n shares
+8. Uploads shares to n servers
+9. Stores the nonce in the parent reference (see Section 7 and 8)
+
+The nonce for each metadata blob is stored in the parent structure that references it. For file inodes, the nonce is stored in the directory entry. For directories, the nonce is stored in the parent directory entry. For the root directory, the nonce is stored in the commit event.
 
 The resulting shares are indistinguishable from file data shares. See Section 14 for detailed privacy analysis.
 
@@ -381,7 +423,7 @@ An inode contains all information necessary to reconstruct a file. After decrypt
   "size": 10485760,
   "created": 1701820800,
   "modified": 1701907200,
-  "key": "<base64-encoded encrypted file key>",
+  "file_id": "<base64-encoded 32-byte random identifier>",
   "blocks": [
     {
       "index": 0,
@@ -411,7 +453,7 @@ An inode contains all information necessary to reconstruct a file. After decrypt
 }
 ```
 
-The `key` field contains the per-file encryption key, encrypted with the metadata key. File content is encrypted to the file key, and the file key is encrypted to the metadata key. This hierarchy enables recovery from nsec + passphrase while keeping file keys isolated.
+The `file_id` field contains a randomly generated 32-byte identifier used to derive the file's encryption key (see Section 6.1). The file key is derived as `HKDF-Expand(master_key, "garland-v1:file:" || file_id, 32)`. This identifier is stored in plaintext within the encrypted inode; an attacker who compromises only `metadata_key` can read the `file_id` but cannot derive the file key without `master_key`.
 
 The `hash` field in each block entry contains the SHA-256 hash of the plaintext block before encryption. This enables integrity verification after decryption: if the decrypted block's hash doesn't match, either the ciphertext was corrupted, the wrong key was used, or the inode itself is corrupt.
 
@@ -458,21 +500,26 @@ A directory is simply a file whose decrypted contents enumerate named entries an
   "entries": {
     "photos": {
       "type": "directory",
-      "inode": "<content hash of photos directory inode blob>"
+      "inode": "<content hash of photos directory inode blob>",
+      "nonce": "<base64-encoded 12-byte nonce for decrypting the inode>"
     },
     "documents": {
       "type": "directory",
-      "inode": "<content hash of documents directory inode blob>"
+      "inode": "<content hash of documents directory inode blob>",
+      "nonce": "<base64-encoded 12-byte nonce>"
     },
     "notes.txt": {
       "type": "file",
-      "inode": "<content hash of notes.txt inode blob>"
+      "inode": "<content hash of notes.txt inode blob>",
+      "nonce": "<base64-encoded 12-byte nonce>"
     }
   }
 }
 ```
 
-The client encrypts and stores directory blobs identically to file inodes: same block size, same encryption, same erasure coding. Entry names remain within the encrypted blob, invisible to servers.
+Each entry includes the `nonce` used to encrypt the referenced inode. This nonce is required to decrypt the inode after fetching its shares. The nonce is stored in the parent directory rather than embedded in the encrypted blob, allowing the same metadata encryption key to be used for all inodes while ensuring unique (key, nonce) pairs.
+
+The client encrypts and stores directory blobs identically to file inodes: same block size, same authenticated encryption, same erasure coding. Entry names remain within the encrypted blob, invisible to servers.
 
 ### 8.2 Merkle DAG Structure
 
@@ -533,21 +580,32 @@ A commit event has the following structure:
   "pubkey": "<owner's public key>",
   "created_at": 1701907200,
   "tags": [
-    ["prev", "<event ID of previous commit>"]
+    ["prev", "<event ID of previous commit>"],
+    ["nonce", "<base64-encoded 12-byte random nonce>"]
   ],
   "content": "<encrypted payload>",
   "sig": "<Schnorr signature>"
 }
 ```
 
-The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The genesis commit omits this tag. The `created_at` timestamp provides temporal ordering; Nostr relays serve events in reverse chronological order by default, enabling efficient head discovery (see Section 9.5).
+The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The genesis commit omits this tag. The `nonce` tag contains the random nonce used to encrypt the content field. The `created_at` timestamp provides temporal ordering; Nostr relays serve events in reverse chronological order by default, enabling efficient head discovery (see Section 9.5).
 
-The client encrypts the `content` field using ChaCha20 with the commit key derived from the master storage key (see Section 6.1). It contains:
+The client encrypts the `content` field using ChaCha20 with the commit key and the nonce from the tag, followed by HMAC-SHA256 authentication:
+
+```
+nonce = random_bytes(12)
+ciphertext = ChaCha20(commit_key, nonce, plaintext)
+mac = HMAC-SHA256(commit_key, nonce || ciphertext)
+content = base64(nonce || ciphertext || mac)
+```
+
+The decrypted content contains:
 
 ```json
 {
   "root_inode": {
     "hash": "<content hash of root directory inode>",
+    "nonce": "<base64-encoded 12-byte nonce for decrypting root inode>",
     "shares": [
       {"id": "<share_hash>", "server": "https://blossom1.example.com"},
       {"id": "<share_hash>", "server": "https://blossom2.example.com"},
@@ -560,7 +618,7 @@ The client encrypts the `content` field using ChaCha20 with the commit key deriv
 }
 ```
 
-The `root_inode` field contains the content hash and share locations for the root directory blob. The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted from storage servers. The optional `message` field allows human-readable commit descriptions.
+The `root_inode` field contains the content hash, decryption nonce, and share locations for the root directory blob. The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted from storage servers. The optional `message` field allows human-readable commit descriptions.
 
 ### 9.2 Commit Process
 
@@ -1379,9 +1437,10 @@ Significant work remains for production deployment. Payment integration, automat
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Block size | 256 KiB | Balance between padding overhead and chunking granularity |
+| Block size (B) | 256 KiB | Balance between padding overhead and chunking granularity |
+| Plaintext capacity (C) | B - 44 bytes | Reserves space for 12-byte nonce + 32-byte MAC |
 | Erasure coding | (n=5, k=3) | Tolerates 2 failures with 67% overhead |
-| Encryption | ChaCha20 | Simple, fast, integrity via content addressing |
+| Encryption | ChaCha20 + HMAC-SHA256 | NIP-44 aligned, authenticated encryption |
 | Key derivation | HKDF-SHA256 | Standard, widely implemented |
 | Commit relays | 5+ | Ensures retrievability despite relay failures |
 | Verification | Weekly | Balances failure detection and bandwidth |
