@@ -233,7 +233,16 @@ The choice of n and k determines the tradeoff between storage overhead, fault to
 | 4 | 7 | 1.75× | 3 failures | 7 |
 | 6 | 9 | 1.50× | 3 failures | 9 |
 
-**Simple replication (k=1)**: When k=1, erasure coding degenerates to simple replication where each share is an identical copy of the full encrypted block. Any single server can provide the complete block with no decoding required. This configuration trades storage efficiency (n× overhead) for operational simplicity and maximum fault tolerance (survives n−1 failures). It suits users who prioritize simplicity over storage cost, or who have access to few servers. Note that with k=1, all servers store blobs with identical hashes, enabling potential cross-server correlation; with k>1, each share has a unique hash.
+**Simple replication (k=1)**: When k=1, erasure coding degenerates to simple replication. To ensure unique share hashes (preventing cross-server correlation), each share includes its index in the plaintext before encryption:
+
+```
+plaintext_i = [share_index: u8] || content[0:C-1]
+encrypted_block_i = encrypt(plaintext_i)
+```
+
+This reduces plaintext capacity by 1 byte for k=1 configurations (C-1 instead of C). During retrieval, the client decrypts and strips the 1-byte prefix to recover the original content.
+
+Any single server can provide the complete block with no decoding required. This configuration trades storage efficiency (n× overhead) for operational simplicity and maximum fault tolerance (survives n-1 failures). It suits users who prioritize simplicity over storage cost, or who have access to few servers.
 
 **Erasure coding (k>1)**: For personal storage, (n=3, k=2) or (n=5, k=3) provides a reasonable balance. The former tolerates one server failure with 50% overhead; the latter tolerates two failures with 67% overhead. Users with access to more servers or heightened durability requirements may choose higher parameters.
 
