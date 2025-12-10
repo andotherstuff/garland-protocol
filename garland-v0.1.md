@@ -184,7 +184,21 @@ P(x) = b₀ + b₁x + b₂x² + ... + b_{k-1}x^{k-1}
 
 The n shares contain the evaluations of P(x) at n distinct points. Using systematic encoding, the first k shares contain the original k pieces unchanged, followed by n - k parity shares.
 
-In practice, encoding multiplies the source vector by a k × n generator matrix (typically derived from a Vandermonde or Cauchy matrix, chosen for their guaranteed invertibility properties). The computational cost is modest: encoding a 256 KiB block completes in milliseconds.
+In practice, encoding multiplies the source vector by a k × n generator matrix derived from a Vandermonde matrix. The computational cost is modest: encoding a 256 KiB block completes in milliseconds.
+
+**Interoperability Requirements**: Two implementations using different Reed-Solomon constructions will produce different shares from identical input, breaking interoperability entirely. All Garland implementations MUST use compatible erasure coding.
+
+The reference implementation is [klauspost/reedsolomon](https://github.com/klauspost/reedsolomon) (Go) with default settings:
+
+- **Field**: GF(2^8)
+- **Generator matrix**: Vandermonde-derived (the upper k×k portion is the identity matrix; the lower (n-k)×k portion contains encoding coefficients)
+- **Encoding**: Systematic (first k shares are the original data pieces, unchanged)
+
+Compatible implementations:
+- **Go**: `klauspost/reedsolomon` with default options
+- **Rust**: `reed-solomon-erasure` crate (port of klauspost)
+
+New implementations MUST verify compatibility by generating shares for test vectors and comparing byte-for-byte against the reference. The Garland project will publish official test vectors. Implementations producing different shares from identical (k, n, input) tuples MUST NOT be deployed together.
 
 **Block size constraint**: The block size B MUST be chosen such that B is evenly divisible by k. If the implementation uses a fixed block size that may not divide evenly for all k values, blocks MUST be padded to the next multiple of k bytes before splitting. Recommended (B, k) pairs for 256 KiB nominal block size:
 
