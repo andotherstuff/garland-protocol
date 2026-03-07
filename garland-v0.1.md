@@ -208,7 +208,35 @@ P(x) = b₀ + b₁x + b₂x² + ... + b_{k-1}x^{k-1}
 
 The n shares contain the evaluations of P(x) at n distinct points. Using systematic encoding, the first k shares contain the original k pieces unchanged, followed by n - k parity shares.
 
-In practice, encoding multiplies the source vector by a k × n generator matrix (typically derived from a Vandermonde or Cauchy matrix, chosen for their guaranteed invertibility properties). The computational cost is modest: encoding a 256 KiB block completes in milliseconds.
+In practice, encoding multiplies the source vector by a k × n generator matrix derived from a Vandermonde matrix. The computational cost is modest: encoding a 256 KiB block completes in milliseconds.
+
+**Interoperability Requirements**: Two implementations using different Reed-Solomon constructions will produce different shares from identical input, breaking interoperability entirely. All Garland implementations MUST use compatible erasure coding.
+
+The reference implementation is [klauspost/reedsolomon](https://github.com/klauspost/reedsolomon) (Go) with default settings:
+
+- **Field**: GF(2^8)
+- **Generator matrix**: Vandermonde-derived (the upper k×k portion is the identity matrix; the lower (n-k)×k portion contains encoding coefficients)
+- **Encoding**: Systematic (first k shares are the original data pieces, unchanged)
+
+Compatible implementations:
+- **Go**: `klauspost/reedsolomon` with default options
+- **Rust**: `reed-solomon-erasure` crate (port of klauspost)
+
+New implementations MUST verify compatibility by generating shares for test vectors and comparing byte-for-byte against the reference. Implementations producing different shares from identical `(k, n, input)` tuples MUST NOT be deployed together.
+
+**Block size constraint**: The block size B is fixed at 262,144 bytes (256 KiB) regardless of k. This uniformity is required for privacy: if B varied by k, share sizes would reveal the erasure coding parameter to storage servers.
+
+When B is not evenly divisible by k, the encrypted block MUST be padded with zero bytes to the next multiple of k before Reed-Solomon encoding. The padding length is `(k - (B mod k)) mod k`, which is at most `k - 1` bytes. During reconstruction, after erasure decoding and concatenating the k data shares, the decoder truncates the result to exactly B bytes, discarding any RS padding.
+
+| k | B (bytes) | RS pad (bytes) | Share size (bytes) |
+|---|-----------|---------------|-------------------|
+| 2 | 262,144 | 0 | 131,072 |
+| 3 | 262,144 | 2 | 87,382 |
+| 4 | 262,144 | 0 | 65,536 |
+| 5 | 262,144 | 1 | 52,429 |
+| 6 | 262,144 | 2 | 43,691 |
+
+The share size is `(B + pad) / k`. Implementations MUST NOT vary B to avoid RS padding.
 
 ### 5.3 Decoding Process
 
@@ -231,7 +259,11 @@ The choice of n and k determines the tradeoff between storage overhead, fault to
 | 4 | 7 | 1.75× | 3 failures | 7 |
 | 6 | 9 | 1.50× | 3 failures | 9 |
 
-**Simple replication (k=1)**: When k=1, erasure coding degenerates to simple replication where each share is an identical copy of the full encrypted block. Any single server can provide the complete block with no decoding required. This configuration trades storage efficiency (n× overhead) for operational simplicity and maximum fault tolerance (survives n−1 failures). It suits users who prioritize simplicity over storage cost, or who have access to few servers. Note that with k=1, all servers store blobs with identical hashes, enabling potential cross-server correlation; with k>1, each share has a unique hash.
+**Simple replication (k=1)**: When k=1, erasure coding degenerates to simple replication. Each of the n servers stores the same encrypted block bytes. No splitting or parity generation occurs, and any single server can provide the complete block.
+
+This mode is simpler to implement and survives n - 1 server failures, but it leaks one extra fact: colluding servers can detect that identical share hashes represent replicas of the same encrypted block. Users who want the strongest cross-server unlinkability SHOULD prefer k > 1.
+
+Any single server can provide the complete block with no decoding required. This configuration trades storage efficiency (n× overhead) for operational simplicity and maximum fault tolerance (survives n−1 failures). It suits users who prioritize simplicity over storage cost, or who have access to few servers.
 
 **Erasure coding (k>1)**: For personal storage, (n=3, k=2) or (n=5, k=3) provides a reasonable balance. The former tolerates one server failure with 50% overhead; the latter tolerates two failures with 67% overhead. Users with access to more servers or heightened durability requirements may choose higher parameters.
 
@@ -260,33 +292,45 @@ nsec + passphrase (empty string default)
   │
   └─► Storage nsec (PBKDF2, see Section 6.4)
         │
-        └─► Master Key (HKDF)
+        └─► PRK (HKDF-Extract)
               │
-              ├─► Commit Key (HKDF-Expand)
-              │
-              ├─► Metadata Key (HKDF-Expand)
-              │
-              ├─► Per-Blob Auth Key (HKDF-Expand with share_id, see Section 11.2)
-              │
-              └─► Per-File Key (random, stored encrypted in inode)
+              └─► Master Key (HKDF-Expand)
                     │
-                    └─► Per-Block Key (HKDF-Expand with block index)
+                    ├─► Commit Key (HKDF-Expand)
+                    │
+                    ├─► Metadata Key (HKDF-Expand)
+                    │     │
+                    │     └─► Per-Inode Key (HKDF-Expand with inode_id, see Section 7.1)
+                    │           │
+                    │           └─► Per-Block Key (HKDF-Expand with block index)
+                    │
+                    ├─► Per-Blob Auth Key (HKDF-Expand with share_id, see Section 11.2)
+                    │
+                    └─► Per-File Key (HKDF-Expand with file_id)
+                          │
+                          └─► Per-Block Key (HKDF-Expand with block index)
 ```
 
-The master storage key is derived from the storage nsec (not the raw user nsec):
+The master storage key is derived from the storage nsec (not the raw user nsec) using the full HKDF (Extract-then-Expand) as defined in RFC 5869:
 
 ```
-master_key = HKDF-SHA256(
-    IKM = storage_nsec,
-    salt = None,
+# Step 1: Extract
+PRK = HKDF-Extract(
+    salt = 0x0000...00 (32 zero bytes),
+    IKM = storage_nsec
+)
+
+# Step 2: Expand
+master_key = HKDF-Expand(
+    PRK = PRK,
     info = "garland-v1:master",
     length = 32
 )
 ```
 
-Per RFC 5869, salt should be independent of IKM; using empty salt is explicitly permitted and avoids any dependency concerns. The storage_nsec already has high entropy from PBKDF2, so the extraction phase primarily provides domain separation via the info string. This derivation is fully deterministic: the same nsec + passphrase always produces the same master key, enabling recovery without storing additional secrets. The storage nsec derivation is described in Section 6.4.
+Per RFC 5869 Section 2.2, when salt is not provided, it defaults to a string of HashLen (32 for SHA-256) zero bytes. The storage_nsec already has high entropy from PBKDF2, so the extraction phase primarily provides domain separation. This derivation is fully deterministic: the same nsec + passphrase always produces the same master key, enabling recovery without storing additional secrets. The storage nsec derivation is described in Section 6.4.
 
-Purpose-specific keys are derived from the master key using HKDF-Expand (no additional salt needed since master_key is already a PRK):
+Purpose-specific keys are derived from the master key using HKDF-Expand only. The master_key is a 32-byte pseudorandom output of HKDF-Expand, which satisfies HKDF-Expand's input requirement of "a pseudorandom key of at least HashLen octets" (RFC 5869 Section 2.3):
 
 ```
 commit_key = HKDF-Expand(
@@ -304,9 +348,22 @@ metadata_key = HKDF-Expand(
 
 The commit key encrypts commit event content. The metadata key encrypts inodes and directory blobs. Separating these keys limits the impact of potential key compromise and clarifies the encryption scope.
 
-Each file receives a randomly generated 256-bit key at creation time. This per-file key is stored within the file's inode, encrypted with the metadata key. Random per-file keys ensure that identical files produce different ciphertexts, preventing content-based correlation.
+Single-block metadata MAY be encrypted directly under `metadata_key` for simplicity. Multi-block metadata derives a per-inode key from `metadata_key` as shown in the diagram and in Section 7.1.
 
-**File modification**: When a file is modified, the client creates a new inode with a freshly generated random file_key. The file_key is never reused across file versions. This is essential because the encryption uses a fixed zero nonce; reusing a file_key for different content would cause keystream reuse, enabling trivial plaintext recovery.
+Each file receives a randomly generated 256-bit `file_id` at creation time. This identifier is stored in plaintext within the inode and used to derive the file's encryption key:
+
+```
+file_id = random_bytes(32)
+file_key = HKDF-Expand(
+    PRK = master_key,
+    info = "garland-v1:file:" || file_id,
+    length = 32
+)
+```
+
+This derivation provides cryptographic separation between metadata and content. An attacker who compromises `metadata_key` can decrypt inodes and learn file structure, but cannot derive `file_key` without `master_key`. The `file_id` in plaintext is meaningless without `master_key`.
+
+**File modification**: When a file is modified, the client creates a new inode with a freshly generated `file_id`. This ensures each file version uses a unique `file_key`, preventing key reuse across versions.
 
 Per-block keys are derived from the file key:
 
@@ -320,19 +377,53 @@ block_key = HKDF-Expand(
 
 ### 6.2 Encryption
 
-Each block is encrypted using ChaCha20, a stream cipher widely used in the Nostr ecosystem (NIP-44) and well-supported across platforms.
+Each block is encrypted using ChaCha20 (RFC 8439, IETF variant with 96-bit nonce, initial block counter = 0) with HMAC-SHA256 authentication, following a construction similar to NIP-44. This provides both confidentiality and authentication.
+
+To maintain cryptographic key separation, each block key is split into distinct encryption and authentication sub-keys via HKDF-Expand:
+
+```
+block_key = HKDF-Expand(K_f, "garland-v1:block:" || block_index_as_u64_be, 32)
+enc_key   = HKDF-Expand(block_key, "garland-v1:enc", 32)
+mac_key   = HKDF-Expand(block_key, "garland-v1:mac", 32)
+```
 
 The encryption process for block i with file key K_f:
 
 ```
 block_key = HKDF-Expand(K_f, "garland-v1:block:" || i, 32)
-nonce = 0x000000000000000000000000  (12 zero bytes)
-ciphertext = ChaCha20(block_key, nonce, plaintext_block)
+enc_key = HKDF-Expand(block_key, "garland-v1:enc", 32)
+mac_key = HKDF-Expand(block_key, "garland-v1:mac", 32)
+nonce = random_bytes(12)
+ciphertext = ChaCha20(enc_key, nonce, plaintext_block)
+mac = HMAC-SHA256(mac_key, nonce || ciphertext)
+encrypted_block = nonce || ciphertext || mac
 ```
 
-Since each block uses a unique derived key, a fixed zero nonce is cryptographically safe: the (key, nonce) pair is never reused. This avoids 12 bytes of overhead per block.
+The encrypted block format is:
 
-Integrity is provided by the content-addressing scheme. Each share is stored and retrieved by its SHA-256 hash, and if a server returns data that doesn't match the requested hash, it is rejected. After decryption, the plaintext block hash is verified against the value stored in the inode. This layered integrity checking at the storage layer makes encryption-layer authentication unnecessary.
+```
+[nonce: 12 bytes][ciphertext: B - 44 bytes][mac: 32 bytes]
+```
+
+**Key separation**: Deriving separate `enc_key` and `mac_key` from each `block_key` avoids dual-use keying.
+
+**Random nonces**: Each block uses a freshly generated random nonce, providing defense-in-depth against implementation bugs that might cause key reuse.
+
+**Authentication**: The HMAC authenticates both the nonce and ciphertext, detecting tampering before decryption. This complements the content-addressing integrity check by catching corruption earlier.
+
+**Decryption process**:
+
+```
+nonce = encrypted_block[0:12]
+ciphertext = encrypted_block[12:-32]
+mac = encrypted_block[-32:]
+enc_key = HKDF-Expand(block_key, "garland-v1:enc", 32)
+mac_key = HKDF-Expand(block_key, "garland-v1:mac", 32)
+expected_mac = HMAC-SHA256(mac_key, nonce || ciphertext)
+if not constant_time_compare(mac, expected_mac):
+    reject("authentication failed")
+plaintext = ChaCha20(enc_key, nonce, ciphertext)
+```
 
 ### 6.3 Metadata Encryption
 
@@ -356,6 +447,27 @@ The resulting shares are indistinguishable from file data shares. See Section 14
 
 ### 6.4 Storage Identity Derivation
 
+Whenever this protocol derives a secp256k1 private key from pseudorandom bytes, implementations MUST use the following rejection-sampling procedure:
+
+```
+SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+function derive_secp256k1_scalar(prk: bytes[32], info: bytes) -> bytes[32]:
+    counter = 0
+    while true:
+        candidate = HKDF-Expand(
+            PRK = prk,
+            info = info || u32_be(counter),
+            length = 32
+        )
+        x = bytes_to_uint256(candidate)
+        if 0 < x < SECP256K1_N:
+            return candidate
+        counter += 1
+```
+
+Implementations MUST NOT reduce candidates modulo the curve order.
+
 The storage nsec is always derived from the user's nsec combined with a passphrase. This derivation serves two purposes: it separates the storage identity from the user's social Nostr identity, and it enables multiple independent storage buckets via different passphrases.
 
 ```
@@ -367,10 +479,11 @@ function derive_storage_nsec(nsec: bytes[32], passphrase: string) -> bytes[32]:
         iterations = 210000,
         output_length = 32
     )
-    return HMAC-SHA256(key = "garland-v1-nsec", message = nsec || stretched)
+    seed = HMAC-SHA256(key = "garland-v1-nsec", message = nsec || stretched)
+    return derive_secp256k1_scalar(seed, "garland-v1:storage-scalar")
 ```
 
-The derivation uses only primitives present in the Nostr ecosystem (HMAC-SHA256, PBKDF2, secp256k1), avoiding new dependencies. PBKDF2 (Password-Based Key Derivation Function 2) deliberately slows key derivation through repeated hashing, making brute-force attacks expensive. The identity-bound salt prevents rainbow tables across users. The 210,000 iteration count follows OWASP 2023 guidelines for PBKDF2-HMAC-SHA256. The derived output is used directly as a secp256k1 private key.
+The derivation uses only primitives present in the Nostr ecosystem (HMAC-SHA256, PBKDF2, secp256k1), avoiding new dependencies. PBKDF2 (Password-Based Key Derivation Function 2) deliberately slows key derivation through repeated hashing, making brute-force attacks expensive. The identity-bound salt prevents rainbow tables across users. The 210,000 iteration count follows OWASP 2023 guidelines for PBKDF2-HMAC-SHA256. The final rejection-sampling step guarantees a valid secp256k1 private key with deterministic behavior across implementations.
 
 **Default passphrase**: When no passphrase is specified, the empty string is used. This is not a special case; the derivation runs identically with `passphrase = ""`. The empty-string bucket serves as the default storage location.
 
@@ -908,7 +1021,7 @@ The `{sha256}` path component is the lowercase hex-encoded SHA-256 hash of the b
 
 ### 11.2 Authentication
 
-Some servers require authentication for write operations (PUT, DELETE) via a Nostr event in the Authorization header. Other servers operate openly without authentication.
+Some servers require authentication for write operations (PUT, DELETE) via a Nostr event in the Authorization header. Other servers operate openly without authentication. Share descriptors record this as `auth: "none"`.
 
 #### Per-Blob Authentication Keys
 
@@ -943,7 +1056,7 @@ The authorization event has kind 24242:
     ["x", "<sha256 of blob being uploaded>"],
     ["expiration", "1701910800"]
   ],
-  "content": "",
+  "content": "garland upload authorization",
   "sig": "<signature from per-blob key>"
 }
 ```
@@ -956,11 +1069,15 @@ With per-blob keys, each blob appears to come from a different user. Servers can
 
 For servers requiring a billing relationship or account management, users may opt into identity key mode, where all authorizations use the storage identity pubkey directly. This enables per-user quotas and billing but allows the server to correlate all blobs to the same owner.
 
-Identity key mode is selected per-server in client configuration. Users should prefer per-blob keys for privacy-focused servers and identity keys only where billing integration requires it.
+Identity key mode is selected per-server in client configuration and recorded as `auth: "identity"` in stored share descriptors. Open servers are recorded as `auth: "none"`. Users should prefer per-blob keys for privacy-focused servers and identity keys only where billing integration requires it.
 
 #### Server Verification
 
-Servers verify the signature, confirm the kind is 24242, check that the action matches the `t` tag, validate that the current time is before expiration, and verify the `x` tag matches the blob hash. Servers do not need to know which authentication mode the client uses; they simply verify valid signatures.
+Servers verify the signature, confirm the kind is 24242, check that the action matches the `t` tag, validate that the current time is before expiration, and verify the `x` tag matches the blob hash.
+
+For authenticated servers, Garland defines an additional delete-ownership rule: the upload authorization also establishes delete authority. A Garland-compatible server MUST persist the authorization pubkey used for each accepted blob hash. A later `DELETE /{sha256}` MUST be accepted only if the authorization event is signed by the same pubkey that authorized the upload, or by an account-level key explicitly configured by the server for identity-key mode. A valid signature by some unrelated pubkey is not sufficient.
+
+This rule is stricter than baseline Blossom interoperability. A generic Blossom server that does not implement Garland's delete-ownership rule is still usable as an append-only server for `PUT`, `GET`, and `HEAD`, but Garland clients MUST NOT assume that `DELETE` will work safely there. Clients SHOULD mark such servers as non-GC targets.
 
 ### 11.3 Server Responses
 
@@ -976,7 +1093,13 @@ Successful upload returns a blob descriptor:
 }
 ```
 
-The URL may differ from the upload endpoint if the server uses a CDN or different domain for retrieval.
+The `url` may differ from the upload endpoint if the server uses a CDN or different domain for retrieval.
+
+Clients MUST persist both write and read semantics in share descriptors:
+- `server`: the authenticated write/delete origin used for `PUT /upload` and `DELETE /{sha256}`
+- `url`: the absolute retrieval URL returned by the server for `GET`/`HEAD`
+
+If the returned `url` is exactly `server + "/" + sha256`, clients MAY omit `url` from stored metadata and derive it on demand. If it differs, clients MUST store it explicitly.
 
 GET requests return the raw blob bytes with appropriate headers:
 
@@ -990,16 +1113,28 @@ HEAD requests return the same headers without the body, enabling existence check
 
 ### 11.4 Server Interchangeability
 
-Blossom servers are interchangeable and fungible. A blob uploaded to server A can be retrieved from server B if server B also has it. The content hash serves as a universal identifier across all servers.
+Blossom servers are interchangeable in that any server can store and serve any blob by its content hash. However, inodes explicitly bind specific server URLs for each share:
 
-This interchangeability enables several patterns:
+```json
+{
+  "shares": [
+    {"id": "<share0_hash>", "server": "https://blossom1.example.com", "url": "https://cdn1.example.com/<share0_hash>", "auth": "blob"},
+    {"id": "<share1_hash>", "server": "https://blossom2.example.com", "auth": "blob"},
+    {"id": "<share2_hash>", "server": "https://blossom3.example.com", "auth": "blob"}
+  ]
+}
+```
 
-- **Mirroring**: Upload the same blob to multiple servers for redundancy
-- **Migration**: Move from one server to another by re-uploading
-- **CDN integration**: Servers can replicate blobs to edge locations
-- **Opportunistic caching**: Clients can check multiple servers and use whichever responds fastest
+Clients fetch shares from `url` when present, otherwise from `server/{id}`. Uploads and deletes always target the `server` origin. There is no automatic discovery mechanism for finding alternative servers that may also host a given share.
 
-The system's erasure coding distributes shares across servers, so migration requires uploading only shares to replacement servers, not the full reconstructed blob.
+In practice, "interchangeability" means:
+
+- **Flexible fetching**: Clients can choose which k of n listed servers to fetch from
+- **Repair via replacement**: Failed servers can be replaced by uploading shares to new servers and updating the inode
+- **Migration**: Move from one server to another by re-uploading shares and updating references
+- **CDN integration**: Servers can replicate blobs to edge locations transparently
+
+The system does not include automatic discovery of alternative servers hosting a given share.
 
 ---
 
@@ -1540,14 +1675,109 @@ Significant work remains for production deployment. Payment integration, automat
 
 ---
 
-## Appendix: Recommended Parameters
+## Appendix A: Recommended Parameters
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Block size | 256 KiB | Balance between padding overhead and chunking granularity |
+| Block size (B) | 262,144 bytes (256 KiB) | Fixed for all k values; balance between padding overhead and chunking granularity |
+| Plaintext frame (C) | B - 44 = 262,100 bytes | Reserves space for 12-byte nonce + 32-byte MAC |
+| Content capacity (C_eff) | C - 4 = 262,096 bytes | Reserves 4 bytes for length prefix in every block |
 | Erasure coding | (n=5, k=3) | Tolerates 2 failures with 67% overhead |
-| Encryption | ChaCha20 | Simple, fast, integrity via content addressing |
+| Encryption | ChaCha20 (RFC 8439) + HMAC-SHA256 | IETF variant, 96-bit nonce, NIP-44 aligned |
 | Key derivation | HKDF-SHA256 | Standard, widely implemented |
 | Commit relays | 5+ | Ensures retrievability despite relay failures |
 | Verification | Weekly | Balances failure detection and bandwidth |
 | Passphrase KDF | PBKDF2, 210k iterations | OWASP 2023 aligned, ~0.5-1s derivation |
+
+---
+
+## Appendix B: Reed-Solomon Test Vectors
+
+All implementations MUST verify compatibility against these test vectors before deployment. These vectors were generated with `github.com/klauspost/reedsolomon` v1.12.4 using default settings (systematic encoding over GF(2^8)).
+
+The common test input is the 12-byte block:
+
+```
+Input (hex): 000102030405060708090a0b
+```
+
+### (k=1, n=3)
+
+```
+Share 0: 000102030405060708090a0b
+Share 1: 000102030405060708090a0b
+Share 2: 000102030405060708090a0b
+```
+
+Reconstruction check: any 1 share reproduces the input block exactly.
+
+### (k=2, n=3)
+
+```
+Share 0: 000102030405
+Share 1: 060708090a0b
+Share 2: 0c0d16171819
+```
+
+Reconstruction check: shares {0,2} and shares {1,2} both reconstruct `000102030405060708090a0b`.
+
+### (k=3, n=5)
+
+```
+Share 0: 00010203
+Share 1: 04050607
+Share 2: 08090a0b
+Share 3: 0c0d0e0f
+Share 4: 10111213
+```
+
+Reconstruction check: shares {0,3,4} reconstruct `000102030405060708090a0b`.
+
+### (k=4, n=6)
+
+```
+Share 0: 000102
+Share 1: 030405
+Share 2: 060708
+Share 3: 090a0b
+Share 4: fc9d56
+Share 5: d7a849
+```
+
+Reconstruction check: shares {0,2,4,5} reconstruct `000102030405060708090a0b`.
+
+### (k=4, n=7)
+
+```
+Share 0: 000102
+Share 1: 030405
+Share 2: 060708
+Share 3: 090a0b
+Share 4: fc9d56
+Share 5: d7a849
+Share 6: 9adb7c
+```
+
+Reconstruction check: shares {1,3,4,6} reconstruct `000102030405060708090a0b`.
+
+### (k=6, n=9)
+
+```
+Share 0: 0001
+Share 1: 0203
+Share 2: 0405
+Share 3: 0607
+Share 4: 0809
+Share 5: 0a0b
+Share 6: 0c0d
+Share 7: 0e0f
+Share 8: 1011
+```
+
+Reconstruction check: shares {0,2,4,6,7,8} reconstruct `000102030405060708090a0b`.
+
+Implementations SHOULD also publish machine-readable test vectors covering:
+1. RS padding when `B mod k != 0`
+2. Block framing and canonical payload hashes
+3. Storage identity derivation and secp256k1 scalar rejection sampling
+4. Commit encryption and inode-reference serialization
