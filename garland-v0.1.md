@@ -105,28 +105,55 @@ When writing a file, the client divides data into fixed-size blocks, encrypts ea
 
 When reading a file, the client traverses from the current chain head through the directory structure to locate the target inode, fetches any k of the n shares for each block, decodes and decrypts the blocks, and reassembles the original file.
 
+### 3.1 Serialization and Wire Formats
+
+All JSON structures in this protocol (inodes, directory entries, commit content) MUST be serialized using RFC 8785 JSON Canonicalization Scheme (JCS) before hashing, signing, or encrypting them. Deterministic serialization is required for content-addressing: two implementations encoding the same logical structure must produce identical bytes.
+
+Implementations MUST NOT rely on insertion order, runtime hash map ordering, platform-specific floating point formatting, ad hoc whitespace rules, or any other non-canonical JSON behavior. Object member ordering, string escaping, Unicode handling, and number rendering MUST follow RFC 8785 exactly.
+
+**Encoding conventions:**
+- **SHA-256 hashes** (share IDs, content hashes): lowercase hex-encoded strings (64 characters)
+- **Binary data** (file_id, inode_id, nonces): standard base64 with padding (RFC 4648 Section 4)
+- **Integers in binary fields** (content_length, block_index): big-endian unsigned
+- **Integers in JSON**: decimal (standard JSON number), but values MUST remain within the I-JSON safe integer range `0 <= x <= 2^53 - 1`
+- **Strings**: UTF-8
+
+These conventions apply throughout the spec. When examples show `<content hash>` or `<share_hash>`, these are lowercase hex strings. When examples show `<base64-encoded 32-byte ...>`, these use standard base64 with `=` padding.
+
 ---
 
 ## 4. Block Layer
 
 ### 4.1 Fixed-Size Blocks
 
-All data entering the system is divided into fixed-size blocks before any cryptographic processing. The block size B is a system parameter, typically 256 KiB (262,144 bytes), though implementations may support alternative sizes for specific use cases.
+All data entering the system is divided into fixed-size blocks before any cryptographic processing. The block size B is a system parameter, fixed at 262,144 bytes (256 KiB). B refers to the total encrypted block size; the plaintext frame per block is `C = B - 44` bytes (262,100 bytes) to accommodate the 12-byte nonce and 32-byte MAC (see Section 6.2).
 
-For a file of size S bytes, the number of blocks is:
-
-```
-N_blocks = ⌈S / B⌉
-```
-
-The final block is padded to exactly B bytes using a length-prefixed padding scheme. Only the final block includes a length prefix: the first four bytes encode the actual content length as a big-endian 32-bit unsigned integer, followed by the content bytes, followed by zero bytes to fill the block:
+Every block uses a uniform length-prefixed format. The first four bytes of each plaintext frame encode the content length as a big-endian 32-bit unsigned integer, followed by the content bytes, followed by random padding to fill the frame:
 
 ```
-Non-final blocks: [content: B bytes]
-Final block:      [content_length: u32_be][content: content_length bytes][padding: zeros]
+Every block: [content_length: u32_be][content: content_length bytes][padding: random bytes to C total]
 ```
 
-This scheme enables unambiguous removal of padding during reconstruction. For the final block, content_length contains `S mod B`. A value of 0 indicates the final block is completely full, meaning the file size is an exact multiple of B. Non-final blocks contain exactly B bytes of content with no overhead.
+The effective content capacity per block is `C_eff = C - 4 = 262,096` bytes. For a file of size S bytes, the number of blocks is:
+
+```
+C = B - 44 = 262,100  (plaintext frame per block)
+C_eff = C - 4 = 262,096  (content capacity per block, after 4-byte length prefix)
+N_blocks = ⌈S / C_eff⌉   (for S > 0; N_blocks = 1 for S = 0)
+```
+
+**content_length semantics**: Each block's `content_length` field stores the number of content bytes in that block:
+
+- **Non-final blocks**: `content_length = C_eff` (the block is completely full of content after the 4-byte prefix, with zero padding bytes)
+- **Final block where `S mod C_eff > 0`**: `content_length = S mod C_eff`
+- **Final block where `S mod C_eff == 0` and `S > 0`**: `content_length = C_eff` (block is full)
+- **Empty file (S = 0)**: a single block with `content_length = 0` (4-byte prefix, then C - 4 bytes of random padding)
+
+The uniform format means every block is parsed identically: read 4-byte prefix, extract `content_length` bytes of content, discard the rest as padding. This eliminates the need to distinguish "final" from "non-final" blocks during decoding -- the only special handling is that the last block's `content_length` may be less than `C_eff`.
+
+The 4-byte-per-block overhead is negligible compared to the padding overhead already inherent in fixed-size blocks.
+
+The padding bytes MUST be randomly generated, not zeros. Random padding avoids known-plaintext at predictable locations within blocks. Since the padding is discarded during reconstruction (the decoder reads exactly `content_length` bytes after the prefix), the random bytes need not be reproducible.
 
 ### 4.2 Privacy Through Uniformity
 
@@ -309,14 +336,21 @@ Integrity is provided by the content-addressing scheme. Each share is stored and
 
 ### 6.3 Metadata Encryption
 
-File inodes and directory entries contain sensitive metadata: filenames, sizes, timestamps, and structural relationships. The client encrypts this metadata using the metadata key derived from the master key.
+File inodes and directory entries contain sensitive metadata: filenames, sizes, timestamps, and structural relationships. The client encrypts this metadata using the metadata key derived from the master key, with the same authenticated framing model used for file blocks.
 
-When storing an inode or directory, the client:
-1. Serializes the structure to JSON
-2. Pads to the fixed block size (256 KiB)
-3. Encrypts using ChaCha20 with the metadata key
-4. Erasure-codes the encrypted block into n shares
-5. Uploads shares to n servers
+When storing a single-block inode or directory, the client:
+1. Serializes the structure to RFC 8785 JCS JSON bytes
+2. Verifies that the serialized length is at most `C_eff = C - 4` bytes
+3. Frames the plaintext exactly as `[content_length: u32_be] || content || random_padding` to total `C = B - 44` bytes, using the same block format as Section 4.1
+4. Derives `enc_key = HKDF-Expand(metadata_key, "garland-v1:enc", 32)` and `mac_key = HKDF-Expand(metadata_key, "garland-v1:mac", 32)`
+5. Generates a random 12-byte nonce
+6. Encrypts using ChaCha20 with `enc_key` and nonce
+7. Computes `HMAC-SHA256(mac_key, nonce || ciphertext)`
+8. Prepends nonce and appends MAC to form a B-byte encrypted block
+9. Erasure-codes the encrypted block into n shares
+10. Uploads shares to n servers
+
+The nonce is embedded in the encrypted block, not stored separately in the parent reference. To decrypt, the client fetches the shares, reconstructs the block, extracts the nonce from the first 12 bytes, verifies the MAC, decrypts, then parses the Section 4.1 frame to recover the JSON bytes.
 
 The resulting shares are indistinguishable from file data shares. See Section 14 for detailed privacy analysis.
 
@@ -367,24 +401,24 @@ An inode contains all information necessary to reconstruct a file. After decrypt
   "size": 10485760,
   "created": 1701820800,
   "modified": 1701907200,
-  "key": "<base64-encoded encrypted file key>",
+  "file_id": "<base64-encoded 32-byte random identifier>",
   "blocks": [
     {
       "index": 0,
-      "hash": "<SHA-256 of plaintext block for integrity verification>",
+      "hash": "<SHA-256 of canonical block payload for integrity verification>",
       "shares": [
-        {"id": "<share0_sha256>", "server": "https://blossom1.example.com"},
-        {"id": "<share1_sha256>", "server": "https://blossom2.example.com"},
-        {"id": "<share2_sha256>", "server": "https://blossom3.example.com"}
+        {"id": "<share0_sha256>", "server": "https://blossom1.example.com", "auth": "blob"},
+        {"id": "<share1_sha256>", "server": "https://blossom2.example.com", "auth": "blob"},
+        {"id": "<share2_sha256>", "server": "https://blossom3.example.com", "auth": "blob"}
       ]
     },
     {
       "index": 1,
-      "hash": "<SHA-256 of plaintext block>",
+      "hash": "<SHA-256 of canonical block payload>",
       "shares": [
-        {"id": "<share0_sha256>", "server": "https://blossom1.example.com"},
-        {"id": "<share1_sha256>", "server": "https://blossom2.example.com"},
-        {"id": "<share2_sha256>", "server": "https://blossom3.example.com"}
+        {"id": "<share0_sha256>", "server": "https://blossom1.example.com", "auth": "blob"},
+        {"id": "<share1_sha256>", "server": "https://blossom2.example.com", "auth": "blob"},
+        {"id": "<share2_sha256>", "server": "https://blossom3.example.com", "auth": "blob"}
       ]
     }
   ],
@@ -397,41 +431,174 @@ An inode contains all information necessary to reconstruct a file. After decrypt
 }
 ```
 
-The `key` field contains the per-file encryption key, encrypted with the metadata key. File content is encrypted to the file key, and the file key is encrypted to the metadata key. This hierarchy enables recovery from nsec + passphrase while keeping file keys isolated.
+The `file_id` field contains a randomly generated 32-byte identifier used to derive the file's encryption key (see Section 6.1). The file key is derived as `HKDF-Expand(master_key, "garland-v1:file:" || file_id, 32)`. This identifier is stored in plaintext within the encrypted inode; an attacker who compromises only `metadata_key` can read the `file_id` but cannot derive the file key without `master_key`.
 
-The `hash` field in each block entry contains the SHA-256 hash of the plaintext block before encryption. This enables integrity verification after decryption: if the decrypted block's hash doesn't match, either the ciphertext was corrupted, the wrong key was used, or the inode itself is corrupt.
+The `hash` field in each block entry contains the SHA-256 hash of the canonical block payload before random padding is added. For file content blocks, the payload is `payload = [content_length: u32_be] || content`, where `content` has exactly `content_length` bytes. Random padding bytes are excluded from this hash because they are discarded during decoding and need not be reproduced during repair. This enables integrity verification after decryption: if the decrypted block's canonical payload hash doesn't match, either the ciphertext was corrupted, the wrong key was used, or the inode itself is corrupt.
 
 The `shares` array is ordered by share index (0 to n-1). The array position determines the share index, which is required for erasure decoding. During reconstruction, the client fetches shares from their listed servers, tracking which indices were successfully retrieved. Once k shares are obtained, decoding can proceed. Storing share indices in the inode (rather than embedding them in share data) provides better privacy: servers cannot determine a share's position in the erasure scheme.
 
+Each share descriptor contains:
+- `id`: lowercase hex SHA-256 of the stored share bytes
+- `server`: absolute HTTPS base URL used for authenticated `PUT` and `DELETE` requests
+- `url`: optional absolute retrieval URL used for `GET` and `HEAD`; if omitted, clients derive it as `server + "/" + id`
+- `auth`: authentication mode used for writes to that server: `"blob"` (per-blob key), `"identity"` (storage identity key), or `"none"` (server accepts unauthenticated writes)
+
+The `auth` field is required for interoperable deletion and repair. The optional `url` field is required whenever the server returns a retrieval endpoint on a different origin than the write endpoint. Recovery clients MUST use `url` for reads when present, and MUST use `server` plus `auth` for uploads, repairs, and deletions.
+
 The client stores inodes as blobs using the same pipeline: serialize, pad, encrypt, erasure-code, and distribute. The resulting structure's content hash forms a node in the Merkle DAG.
 
-### 7.1 Large File Inodes
+### 7.1 Large Inodes
 
-Files with many blocks may produce inodes exceeding the standard block size. With (n=5, k=3) erasure coding, each block entry requires approximately 500 bytes for share IDs and server URLs. A file with 500,000 blocks would generate a ~250 MB inode, far exceeding the 256 KiB block limit.
+Any inode (file or directory) may exceed the plaintext capacity C when serialized. With (n=5, k=3) erasure coding, each block entry requires approximately 500 bytes for share IDs and server URLs. A file with 500,000 blocks or a directory with thousands of entries could exceed the block size limit.
 
-For files exceeding approximately 500 blocks, the inode uses an indirect block structure:
+When an inode exceeds C bytes, it is stored as multiple blocks using the same framing and hashing rules as file content:
+
+1. Serialize the inode to JSON
+2. Split the serialized bytes into payload chunks of at most `C_eff` bytes, then frame each chunk as `[content_length || content || random_padding]` per Section 4.1
+3. Encrypt each block with a key derived from a single `inode_id`
+4. Erasure-code and upload each encrypted block
+5. The parent reference includes the `inode_id` and block list
+
+A multi-block inode reference in a directory entry:
+
+```json
+{
+  "photos": {
+    "type": "directory",
+    "ref": {
+      "format": "multi",
+      "inode_id": "<base64-encoded 32-byte random identifier>",
+      "erasure": {"algorithm": "reed-solomon", "k": 2, "n": 3, "field": "gf256"},
+      "blocks": [
+        {
+          "index": 0,
+          "hash": "<SHA-256 of canonical block payload>",
+          "shares": [
+            {"id": "<share0_sha256>", "server": "https://blossom1.example.com", "auth": "blob"},
+            {"id": "<share1_sha256>", "server": "https://blossom2.example.com", "auth": "blob"},
+            {"id": "<share2_sha256>", "server": "https://blossom3.example.com", "auth": "blob"}
+          ]
+        },
+        {
+          "index": 1,
+          "hash": "<SHA-256 of canonical block payload>",
+          "shares": [...]
+        }
+      ]
+    }
+  }
+}
+```
+
+The `inode_id` inside a multi-block inode reference serves the same purpose as `file_id` for file content, enabling deterministic key derivation for multi-block data:
+
+```
+inode_key = HKDF-Expand(metadata_key, "garland-v1:inode:" || inode_id, 32)
+block_key = HKDF-Expand(inode_key, "garland-v1:block:" || block_index_as_u64_be, 32)
+```
+
+Each block is then encrypted using the standard enc/mac key split: derive `enc_key` and `mac_key` from `block_key` via HKDF-Expand (Section 6.2), then encrypt with ChaCha20 and authenticate with HMAC-SHA256 using a random nonce. The `hash` field for each large-inode block follows the same canonical-payload rule as file blocks: `SHA256([content_length: u32_be] || content)`.
+
+For single-block inodes (the common case), the inode is encrypted directly with `metadata_key` and the nonce is embedded in the encrypted block. The plaintext still uses the Section 4.1 framed block format with `C_eff` content capacity. Implementations should use this simpler approach when the serialized inode fits in one block.
+
+This unified approach means the same chunking mechanism handles large files, large directories, and any future large metadata. Implementations use one code path for all cases.
+
+### 7.2 Inline Small Files
+
+Files below a configurable size threshold (default: 4 KiB) MAY be stored inline within their inode, avoiding the overhead of a separate block pipeline. A 100-byte file stored as a full block requires B bytes of encrypted storage plus n shares of size B/k each -- hundreds of kilobytes for a few bytes of content. Inlining eliminates this waste.
+
+An inline inode stores the encrypted file content directly:
 
 ```json
 {
   "version": 1,
   "type": "file",
-  "size": 137438953472,
-  "indirect": true,
-  "block_index": [
-    {"hash": "<content hash of block index chunk 0>", "shares": [...]},
-    {"hash": "<content hash of block index chunk 1>", "shares": [...]}
-  ],
-  "erasure": {"algorithm": "reed-solomon", "k": 2, "n": 3}
+  "size": 95,
+  "created": 1701820800,
+  "modified": 1701907200,
+  "file_id": "<base64-encoded 32-byte random identifier>",
+  "inline": "<base64-encoded encrypted content>",
+  "erasure": {
+    "algorithm": "reed-solomon",
+    "k": 2,
+    "n": 3,
+    "field": "gf256"
+  }
 }
 ```
 
-Each block index chunk contains an array of block entries, stored as a separate encrypted blob. This bounds inode size regardless of file size, at the cost of one additional fetch per block index chunk during file access.
+When the `inline` field is present, the `blocks` array is omitted. The inline content is encrypted with the file's `file_key` (derived from `master_key` and `file_id`, see Section 6.1), NOT with `metadata_key`. This preserves key separation: an attacker who compromises `metadata_key` can read the inode structure (filenames, sizes, timestamps, and the opaque `inline` ciphertext) but cannot decrypt the file content without `master_key`.
+
+The inline ciphertext uses the same authenticated encryption format as block content:
+
+```
+enc_key = HKDF-Expand(file_key, "garland-v1:enc", 32)
+mac_key = HKDF-Expand(file_key, "garland-v1:mac", 32)
+nonce = random_bytes(12)
+ciphertext = ChaCha20(enc_key, nonce, file_content)
+mac = HMAC-SHA256(mac_key, nonce || ciphertext)
+inline_value = base64(nonce || ciphertext || mac)
+```
+
+Note that the block index derivation step is skipped for inline content (there is no `block_key`; `enc_key` and `mac_key` are derived directly from `file_key`). No inner padding is needed: the file size is already visible in the `size` field to anyone who can decrypt the inode with `metadata_key`.
+
+The resulting inode (containing the inline ciphertext) is then encrypted with `metadata_key` and stored through the normal inode pipeline. This produces double encryption (`file_key` inside `metadata_key`), which is a standard and safe cryptographic pattern.
+
+Implementations SHOULD inline files when the serialized inode (including inline content) fits within a single block's plaintext capacity C. Implementations MUST support reading inline inodes even if they do not write them.
 
 ---
 
 ## 8. Directory Hierarchy
 
 ### 8.1 Directories as Encrypted Blobs
+
+Garland uses a single canonical inode reference format everywhere a blob graph points to another inode: directory entries, commit roots, and any preserved historical commit references. Every inode reference MUST include enough information for an independent implementation to fetch and decode it without relying on bucket-global defaults.
+
+Single-block inode reference:
+
+```json
+{
+  "format": "single",
+  "hash": "<content hash of encrypted inode blob>",
+  "erasure": {
+    "algorithm": "reed-solomon",
+    "k": 2,
+    "n": 3,
+    "field": "gf256"
+  },
+  "shares": [
+    {"id": "<share0_sha256>", "server": "https://blossom1.example.com", "auth": "blob"},
+    {"id": "<share1_sha256>", "server": "https://blossom2.example.com", "auth": "blob"},
+    {"id": "<share2_sha256>", "server": "https://blossom3.example.com", "auth": "blob"}
+  ]
+}
+```
+
+Multi-block inode reference:
+
+```json
+{
+  "format": "multi",
+  "inode_id": "<base64-encoded 32-byte random identifier>",
+  "erasure": {
+    "algorithm": "reed-solomon",
+    "k": 2,
+    "n": 3,
+    "field": "gf256"
+  },
+  "blocks": [
+    {
+      "index": 0,
+      "hash": "<SHA-256 of canonical block payload>",
+      "shares": [
+        {"id": "<share0_sha256>", "server": "https://blossom1.example.com", "auth": "blob"},
+        {"id": "<share1_sha256>", "server": "https://blossom2.example.com", "auth": "blob"},
+        {"id": "<share2_sha256>", "server": "https://blossom3.example.com", "auth": "blob"}
+      ]
+    }
+  ]
+}
+```
 
 A directory is simply a file whose decrypted contents enumerate named entries and their corresponding inode references. After decryption, a directory blob contains:
 
@@ -444,27 +611,50 @@ A directory is simply a file whose decrypted contents enumerate named entries an
   "entries": {
     "photos": {
       "type": "directory",
-      "inode": "<content hash of photos directory inode blob>"
+      "ref": {
+        "format": "single",
+        "hash": "<content hash of photos directory inode blob>",
+        "erasure": {"algorithm": "reed-solomon", "k": 2, "n": 3, "field": "gf256"},
+        "shares": [
+          {"id": "<share0_sha256>", "server": "https://blossom1.example.com", "auth": "blob"},
+          {"id": "<share1_sha256>", "server": "https://blossom2.example.com", "auth": "blob"},
+          {"id": "<share2_sha256>", "server": "https://blossom3.example.com", "auth": "blob"}
+        ]
+      }
     },
     "documents": {
       "type": "directory",
-      "inode": "<content hash of documents directory inode blob>"
+      "ref": {
+        "format": "single",
+        "hash": "<content hash of documents directory inode blob>",
+        "erasure": {"algorithm": "reed-solomon", "k": 2, "n": 3, "field": "gf256"},
+        "shares": [...]
+      }
     },
     "notes.txt": {
       "type": "file",
-      "inode": "<content hash of notes.txt inode blob>"
+      "ref": {
+        "format": "single",
+        "hash": "<content hash of notes.txt inode blob>",
+        "erasure": {"algorithm": "reed-solomon", "k": 2, "n": 3, "field": "gf256"},
+        "shares": [...]
+      }
     }
   }
 }
 ```
 
-The client encrypts and stores directory blobs identically to file inodes: same block size, same encryption, same erasure coding. Entry names remain within the encrypted blob, invisible to servers.
+Each entry contains a `ref` object with the full inode reference. Single-block references carry the encrypted inode blob hash and share locations directly. Multi-block references carry an `inode_id`, erasure parameters, and per-block share lists. Readers MUST use the erasure parameters from the reference itself, not infer them from bucket defaults or current client configuration.
+
+Implementations SHOULD use a single bucket-wide erasure profile for ordinary operation. The per-reference `erasure` field exists for decode safety and forward compatibility, not to encourage frequent per-blob parameter changes. Reusing one profile across a bucket keeps share sizes uniform and minimizes privacy leakage from server-visible blob dimensions.
+
+The client encrypts and stores directory blobs identically to file inodes: same block size, same authenticated encryption, same erasure coding. Entry names remain within the encrypted blob, invisible to servers.
 
 ### 8.2 Merkle DAG Structure
 
-The directory hierarchy forms a Merkle Directed Acyclic Graph (DAG), a tree-like structure where each node is identified by the cryptographic hash of its contents and parent nodes include the hashes of their children. Any modification to a child changes its hash, which propagates up to the root.
+The directory hierarchy forms a Merkle Directed Acyclic Graph (DAG), a tree-like structure where authenticated references point from parent nodes to child nodes. Any modification to a child changes either the encrypted blob hash (for single-block nodes) or the ordered block metadata inside its inode reference (for multi-block nodes), which propagates upward when parents are rewritten.
 
-Each node, whether file inode or directory, is identified by the content hash of its encrypted representation.
+Single-block nodes are identified by the content hash of their encrypted representation. Multi-block nodes are identified by their full inode reference (`inode_id`, erasure parameters, and ordered block list).
 
 ```
                     ┌─────────────────┐
@@ -487,17 +677,17 @@ Each node, whether file inode or directory, is identified by the content hash of
     └───────────────┘ └───────────────┘
 ```
 
-This structure provides several important properties. Any node's hash authenticates its entire subtree: if an attacker modifies any descendant, the hashes will not match during traversal. The structure can be verified incrementally; a client can validate a path from root to a specific file without fetching the entire tree. Unchanged subtrees share storage; updating one file doesn't require re-uploading siblings.
+This structure provides several important properties. Any authenticated inode reference validates the child subtree it names: if an attacker modifies any descendant, share hashes, block hashes, or inode-reference checks will fail during traversal. The structure can be verified incrementally; a client can validate a path from root to a specific file without fetching the entire tree. Unchanged subtrees share storage; updating one file doesn't require re-uploading siblings.
 
 ### 8.3 Path Resolution
 
 To resolve a path like `/photos/image1.jpg`, the client:
 
-1. Obtains the root directory hash from the current chain head
-2. Fetches and decrypts the root directory blob
-3. Looks up "photos" in the entries, obtaining hash 0xDEF
-4. Fetches and decrypts the photos directory blob  
-5. Looks up "image1.jpg" in the entries, obtaining hash 0x789
+1. Obtains the root inode reference from the current chain head
+2. Fetches and decrypts the root directory inode from that reference
+3. Looks up `"photos"` in the entries, obtaining the child inode reference
+4. Fetches and decrypts the photos directory inode
+5. Looks up `"image1.jpg"` in the entries, obtaining the file inode reference
 6. Fetches and decrypts the image1.jpg inode
 7. Uses the inode to fetch, decode, decrypt, and reassemble the file
 
@@ -1345,6 +1535,8 @@ Significant work remains for production deployment. Payment integration, automat
 10. IETF RFC 2898. PKCS #5: Password-Based Cryptography Specification Version 2.0. https://tools.ietf.org/html/rfc2898
 
 11. BIP-39. Mnemonic code for generating deterministic keys. https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+
+12. IETF RFC 8785. JSON Canonicalization Scheme (JCS). https://www.rfc-editor.org/rfc/rfc8785
 
 ---
 
