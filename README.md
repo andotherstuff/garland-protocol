@@ -59,15 +59,15 @@ See [garland-v0.md](garland-v0.md) and [garland-v0.1.md](garland-v0.1.md) for th
 
 **Commit Ordering**
 - *v0:* Replaceable event with implicit ordering
-- *v0.1:* No sequence counter, head discovery via `limit=1` relay query (reverse chronological), chain traversal via `prev` tags for full history
+- *v0.1:* Encrypted commit chain with monotonic `seq`, `created_at` used only as a relay hint, full traversal required for fork-safe head selection
 
 **Encryption**
 - *v0:* ChaCha20-Poly1305 or AES-GCM (underspecified)
-- *v0.1:* ChaCha20 with fixed zero nonce and unique per-block keys (HKDF-Expand), integrity via content addressing (SHA-256 share IDs + plaintext block hashes in inodes)
+- *v0.1:* ChaCha20 (RFC 8439) with random nonces, HMAC-SHA256, split enc/mac keys, integrity via share IDs plus canonical block-payload hashes
 
 **Key Derivation**
 - *v0:* Generic KDF, underspecified
-- *v0.1:* HKDF-SHA256 with empty salt for master key, HKDF-Expand for derived keys, versioned info strings (garland-v1:*), file_key must be regenerated on modification
+- *v0.1:* HKDF-SHA256 with explicit Extract/Expand stages, versioned info strings, derived per-file keys, and deterministic secp256k1 scalar rejection sampling for auth/storage keys
 
 **Relay Discovery**
 - *v0:* Unspecified, assumed NIP-65 or manual

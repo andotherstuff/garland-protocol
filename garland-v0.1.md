@@ -821,35 +821,56 @@ A commit event has the following structure:
   "kind": 1097,
   "pubkey": "<owner's public key>",
   "created_at": 1701907200,
-  "tags": [
-    ["prev", "<event ID of previous commit>"]
-  ],
+  "tags": [],
   "content": "<encrypted payload>",
   "sig": "<Schnorr signature>"
 }
 ```
 
-The `prev` tag contains the event ID of the immediately preceding commit, creating the chain. The genesis commit omits this tag. The `created_at` timestamp provides temporal ordering; Nostr relays serve events in reverse chronological order by default, enabling efficient head discovery (see Section 9.5).
+The commit event has no tags. All metadata is encrypted within the `content` field. The `created_at` timestamp is a relay-level ordering hint; Nostr relays serve events in reverse chronological order by default, which helps clients discover recent commit candidates but does not define the canonical head.
 
-The client encrypts the `content` field using ChaCha20 with the commit key derived from the master storage key (see Section 6.1). It contains:
+The client encrypts the `content` field using the enc/mac key split (Section 6.2) applied to the commit key:
+
+```
+enc_key = HKDF-Expand(commit_key, "garland-v1:enc", 32)
+mac_key = HKDF-Expand(commit_key, "garland-v1:mac", 32)
+nonce = random_bytes(12)
+ciphertext = ChaCha20(enc_key, nonce, plaintext)
+mac = HMAC-SHA256(mac_key, nonce || ciphertext)
+content = base64(nonce || ciphertext || mac)
+```
+
+The nonce is prepended to the ciphertext within the base64-encoded content, not stored in a tag.
+
+The decrypted content contains:
 
 ```json
 {
+  "prev": "<event ID of previous commit, or null for genesis>",
+  "seq": 42,
   "root_inode": {
+    "format": "single",
     "hash": "<content hash of root directory inode>",
+    "erasure": {"algorithm": "reed-solomon", "k": 2, "n": 3, "field": "gf256"},
     "shares": [
-      {"id": "<share_hash>", "server": "https://blossom1.example.com"},
-      {"id": "<share_hash>", "server": "https://blossom2.example.com"},
-      {"id": "<share_hash>", "server": "https://blossom3.example.com"}
+      {"id": "<share_hash>", "server": "https://blossom1.example.com", "auth": "blob"},
+      {"id": "<share_hash>", "server": "https://blossom2.example.com", "auth": "blob"},
+      {"id": "<share_hash>", "server": "https://blossom3.example.com", "auth": "blob"}
     ]
   },
-  "erasure": {"k": 2, "n": 3},
-  "garbage": ["<hash1>", "<hash2>"],
+  "garbage": [
+    {"id": "<share_id>", "server": "https://blossom1.example.com", "auth": "blob"},
+    {"id": "<share_id>", "server": "https://blossom2.example.com", "auth": "blob"}
+  ],
   "message": "Added vacation photos"
 }
 ```
 
-The `root_inode` field contains the content hash and share locations for the root directory blob. The `garbage` array lists blob hashes that are no longer referenced as of this commit and may be deleted from storage servers. The optional `message` field allows human-readable commit descriptions.
+The `prev` field contains the event ID of the immediately preceding commit, creating the chain. The genesis commit sets `prev` to null. Encrypting `prev` hides the commit chain structure from observers, who see only that commits exist but not how they link together.
+
+The `seq` field is a monotonically increasing non-negative integer, starting at 0 for the genesis commit. It MUST remain within the I-JSON safe integer range `0 <= seq <= 2^53 - 1`. For every non-genesis commit, implementations MUST enforce `child.seq = parent.seq + 1`. Clients MAY use `created_at` as a relay query hint, but they MUST NOT use it as the canonical fork-choice rule. A client that has previously accepted a head SHOULD persist its `(event_id, seq)` locally and treat any lower-seq candidate head as stale unless the user explicitly enters recovery mode. The `seq` value is inside the encrypted content, so it is not visible to relays or observers.
+
+The `root_inode` field contains the full inode reference for the root directory, including whatever share locations are needed to fetch it. The `garbage` array lists share IDs, server URLs, and auth modes for shares that are no longer referenced as of this commit and may become deletion candidates (see Section 13.3). The optional `message` field allows human-readable commit descriptions.
 
 ### 9.2 Commit Process
 
@@ -887,13 +908,13 @@ Between saves, the local state may be lost if the device fails. This is acceptab
 
 ### 9.4 Chain Traversal and History
 
-The complete history is recoverable by walking the chain backward from the head. Each commit's `prev` tag leads to its predecessor until reaching the genesis commit, which omits the `prev` tag entirely.
+The complete history is recoverable by walking the chain backward from the head. Each commit's `prev` field (within the encrypted content) leads to its predecessor until reaching the genesis commit (which has `prev: null`).
 
 ```
 HEAD ──prev──► Commit N-1 ──prev──► Commit N-2 ──prev──► ... ──prev──► Genesis
 ```
 
-Clients can implement time-travel functionality: given any historical commit, they can reconstruct the exact filesystem state at that point by using the commit's root hash to traverse the Merkle DAG.
+Clients can implement time-travel functionality: given any historical commit, they can reconstruct the exact filesystem state at that point by using the commit's `root_inode` reference to traverse the Merkle DAG.
 
 This history has storage implications. Old commits reference old blobs which must be retained for history to remain valid. Users who don't need history can garbage collect aggressively. Users who value history must retain more data. Section 13 discusses garbage collection in detail.
 
@@ -903,51 +924,62 @@ The commit chain requires two operations: finding the current head for normal us
 
 #### Finding the Chain Head
 
-Nostr relays return events in reverse chronological order by `created_at` timestamp. To find the current chain head, clients query for kind 1097 events with `limit=1`:
+Nostr relays return events in reverse chronological order by `created_at` timestamp. Clients MAY use a `limit=1` query as a latency optimization to discover recent candidates, but the result is only a hint:
 
 ```
 REQ: ["REQ", <sub_id>, {"kinds": [1097], "authors": [<pubkey>], "limit": 1}]
 ```
 
-The relay returns the most recent commit event. In normal operation, where commits are created sequentially from a single device or with proper conflict resolution, this is the chain head.
+The relay returns the most recent commit event by timestamp, not necessarily the canonical head. Clients MUST validate candidate heads by fetching commit events from all configured storage relays, decrypting them, and applying the sequence and ancestry rules below.
 
-If different relays return different "most recent" events (due to propagation delays or clock skew), clients should fall back to full chain traversal to determine the true head. Fetch all commits, build the chain graph, and identify the canonical head as described below.
+In steady-state operation, a client can usually stop after it has found one valid tip with the highest observed `seq` and confirmed that no configured relay exposes a competing tip at the same or higher `seq`. If that condition does not hold, the client MUST fall back to full chain traversal.
 
 #### Full Chain Traversal
 
 For disaster recovery or history reconstruction, clients traverse the complete chain:
 
-1. Query for all kind 1097 events by the owner's pubkey (no limit)
-2. Build an index: `event_id → event` and `prev → event_id`
-3. Identify the head: the event whose ID appears in no other event's `prev` tag
-4. Walk backward via `prev` tags until reaching genesis (the commit with no `prev` tag)
+1. Query all configured storage relays for kind 1097 events by the owner's pubkey (no limit, or enough pages to exhaust the relay's results)
+2. Decrypt each commit's content to extract its `prev` field
+3. Discard any commit whose parent is missing, whose `seq` does not equal `parent.seq + 1`, whose MAC fails, or whose plaintext does not match the schema in Section 9.1. The only exception is genesis: exactly one commit may use `prev = null`, and it MUST have `seq = 0`.
+4. Build indexes: `event_id → event`, `prev → child events`, and `seq → tip candidates`
+5. Identify valid tips: commits whose IDs appear in no other valid commit's `prev` field
+6. If exactly one valid tip has the highest observed `seq`, treat it as the head
+7. If multiple valid tips share the highest observed `seq`, the chain is forked; the client MUST stop automatic head selection and require reconciliation
+8. Walk backward via `prev` fields until reaching genesis (the commit with `prev: null`)
 
-This traversal reconstructs the complete history without requiring any decryption. The chain structure is visible in plaintext `prev` tags; only the content (root hashes, garbage lists, messages) requires decryption.
+Since `prev` is encrypted, chain traversal requires decrypting all commits. This is acceptable because:
+- Commits are small (a few hundred bytes each)
+- Decryption is fast (ChaCha20 + HMAC verification)
+- Commits must be decrypted anyway to access their content
+- The privacy benefit (hiding chain structure) outweighs the cost
 
 #### Fork Detection
 
-Forks occur when two commits share the same `prev` value, meaning both claim to follow the same parent. During traversal:
+Forks occur when two or more valid commits share the same `prev` value, meaning they all claim to follow the same parent.
 
-1. If multiple events have the same `prev`, a fork exists
-2. The event with the later `created_at` timestamp is the canonical head
-3. The other branch may contain commits that need merging or represent conflicting changes
+1. If multiple valid events have the same `prev`, a fork exists
+2. `created_at` MAY be shown in UI, but it MUST NOT be used to pick the canonical branch
+3. Garland v0.1 commits have exactly one parent (`prev`). They do not encode multi-parent merges.
+4. A conflict ends only when the user or application selects one branch as canonical and publishes a new descendant commit from that chosen tip. Any incorporation of changes from another branch is an application-level operation that produces ordinary single-parent commits.
+5. Until user-directed reconciliation occurs, the bucket is in conflict state and clients MUST NOT run garbage collection
 
 For personal single-device usage, forks are rare. Multi-device deployments should implement merge strategies (Section 9.2).
 
 ### 9.6 Metadata Privacy
 
-Commit events are publicly visible on relays. To minimize metadata leakage, sensitive fields are encrypted within the `content` field:
+Commit events are publicly visible on relays. To minimize metadata leakage, all fields except those required by Nostr are encrypted within the `content` field:
 
-- **Root hash**: Stored only in encrypted content. Observers cannot detect when the filesystem changes or correlate commits with blob uploads.
-- **Garbage list**: Stored only in encrypted content. Observers cannot determine when data is being deleted.
-- **Commit message**: Stored only in encrypted content.
+- **Prev pointer**: Encrypted. Observers cannot see how commits link together.
+- **Root inode reference**: Encrypted. Observers cannot detect when the filesystem changes or correlate commits with blob uploads.
+- **Garbage list**: Encrypted. Observers cannot determine when data is being deleted.
+- **Commit message**: Encrypted.
 
 The only plaintext metadata exposed is:
-- The `prev` tag linking to the parent commit (necessary for chain traversal)
 - The `created_at` timestamp (required by Nostr protocol)
 - The owner's public key (inherent to Nostr signatures)
+- The existence of commits (event count reveals activity frequency)
 
-The `prev` tag reveals chain structure but not contents. Observers can count commits and analyze timing patterns from `created_at` timestamps, but cannot determine what changed between commits or how much data each commit affects. Users concerned about timing analysis can batch commits or add random delays to `created_at` values (within Nostr's tolerance for clock skew).
+Observers can count commits and analyze timing patterns from `created_at` timestamps, but cannot determine what changed between commits, how much data each commit affects, or how commits relate to each other. Users concerned about timing analysis can batch commits or add random delays to `created_at` values (within Nostr's tolerance for clock skew).
 
 ---
 
@@ -955,19 +987,19 @@ The `prev` tag reveals chain structure but not contents. Observers can count com
 
 ### 10.1 Recovery Process
 
-Disaster recovery requires the owner's Nostr secret key (nsec) and passphrase (empty string if none was set). No backup files, no secondary credentials, no trusted third party. The recovery process:
+Disaster recovery requires the owner's Nostr secret key (nsec) and passphrase (empty string if none was set). No secondary decryption key or trusted third party is required. Operational recovery still assumes access to at least one relay that retained the commit chain, or a previously cached/exported relay list. The recovery process:
 
 1. **Derive storage identity**: Combine nsec + passphrase to derive storage nsec (Section 6.4)
 2. **Derive storage npub**: Compute public key from storage nsec using secp256k1
 3. **Discover relays**: Use client-configured storage relays (see Section 10.2)
 4. **Derive master key**: Compute master storage key from storage nsec via HKDF
-5. **Find chain head**: Query relays for kind 1097 events with author = storage npub and limit = 1; the most recent commit by `created_at` is the head
+5. **Find chain head**: Query all configured relays for kind 1097 events with author = storage npub, decrypt the returned commits, and select the unique valid tip with the highest `seq` as described in Section 9.5
 6. **Decrypt commit**: Decrypt the head commit's content field using the commit key derived from master key
-7. **Fetch root**: Download k shares of the root directory inode using URLs from the commit
+7. **Fetch root**: Download k shares of the root directory inode using the `root_inode` reference from the commit
 8. **Decode and decrypt**: Erasure-decode and decrypt the root directory
 9. **Traverse**: Recursively fetch any desired files through the directory structure
 
-For full history recovery, omit the limit parameter in step 4, fetch all commits, and traverse the chain via `prev` tags as described in Section 9.5.
+For full history recovery, omit the limit parameter in step 4, fetch all commits, and traverse the chain via encrypted `prev` fields as described in Section 9.5.
 
 The Nostr relay network serves as the discovery layer. Relays are interchangeable: the client can query any relay that might have stored the owner's events. Since events are signed, their authenticity is verifiable regardless of which relay provides them.
 
@@ -975,9 +1007,34 @@ The Nostr relay network serves as the discovery layer. Relays are interchangeabl
 
 Recovery reliability depends on commit events being retrievable from at least one relay. Users should publish commits to multiple relays and periodically verify that relays still hold their events.
 
-**Storage relay list**: Clients maintain an encrypted list of relays dedicated to storage commits. This list is stored within the storage system itself (as an encrypted blob) and also cached locally. The relay list is independent of the user's social NIP-65 relay list, preventing linkage between storage and social identities.
+**Storage relay list**: Clients maintain an encrypted list of relays dedicated to storage commits. This list is stored within the storage system itself as a small metadata inode referenced from the root directory under a reserved internal path such as `/.garland/relays.json`, and it is also cached locally. The relay list is independent of the user's social NIP-65 relay list, preventing linkage between storage and social identities.
 
-For initial setup or recovery without a cached relay list, clients use a hardcoded set of well-known public relays to bootstrap. Once the commit chain is located, the encrypted relay list can be retrieved and decrypted for ongoing use.
+The relay-list plaintext is a JCS-serialized JSON object:
+
+```json
+{
+  "version": 1,
+  "relays": [
+    "wss://relay1.example.com",
+    "wss://relay2.example.com"
+  ],
+  "updated": 1701907200
+}
+```
+
+Clients SHOULD also support an optional exported recovery checkpoint containing:
+- the storage pubkey
+- the relay list
+- the highest accepted `(seq, event_id)` pair
+
+Backup-oriented implementations SHOULD enable encrypted export/import of this checkpoint by default.
+
+For initial setup or recovery without a cached relay list, clients use a hardcoded set of well-known public relays to bootstrap. Once the commit chain is located, the encrypted relay list can be retrieved and decrypted for ongoing use. Because relay retention is an operational assumption rather than a cryptographic guarantee, clients SHOULD offer an export/import mechanism for the relay list and highest accepted head as a recovery aid.
+
+If a client has a local or imported recovery checkpoint, recovery MUST apply these anti-rollback rules:
+- If the discovered tip has lower `seq` than the checkpoint, the client MUST stop and require manual recovery.
+- If the discovered tip has the same `seq` but a different `event_id`, the client MUST treat the bucket as forked.
+- Clients MUST NOT run garbage collection from an unanchored recovery session that lacks either a trusted checkpoint or a previously accepted local head.
 
 Relay selection strategies include:
 
@@ -1151,7 +1208,7 @@ A steward is a process (potentially running on a dedicated server, a home machin
 3. Detects failures and initiates repair when shares become unavailable
 4. Updates the commit chain with new share locations after repair
 
-The steward requires sufficient credentials to perform these operations. In the simplest model, it holds the owner's nsec (or derived storage nsec if using passphrase protection). More sophisticated deployments might use delegated keys with limited authority, sufficient to read manifests and upload replacement shares but unable to delete data or modify directory structure.
+The steward requires sufficient credentials to perform these operations. In Garland v0.1, a fully capable steward requires the owner's nsec (or derived storage nsec if using passphrase protection), because it must read manifests, upload replacement shares, and publish repair commits. Delegated or reduced-authority steward keys are future work, not part of the v0.1 interoperability surface.
 
 The verification frequency depends on the user's durability requirements and tolerance for data loss. Weekly verification catches most server failures before they cascade. Daily verification provides stronger guarantees at higher bandwidth cost. Users with critical data might verify continuously, while archival users might verify monthly.
 
@@ -1206,32 +1263,17 @@ This guarantees the server holds the exact data, at the cost of downloading ever
 
 #### Privacy-Preserving Verification via Server Filters
 
-Blossom servers may publish probabilistic data structures (such as fuse filters) listing all blob hashes they store. Clients can query these filters locally without revealing which specific blobs they're checking. Fuse filters are a modern alternative to Bloom filters, offering better space efficiency and query performance while providing the same probabilistic membership testing.
+Probabilistic server filters (for example fuse filters listing stored blob hashes) are a promising future extension, but Garland v0.1 does not standardize their endpoint, format, or capability negotiation. Implementations MAY experiment with them out of band, but they are not part of the interoperable verification surface for v0.1.
 
-```
-GET /filter
-→ Returns fuse filter of all stored blob hashes
-
-Client checks: share_hash ∈ filter?
-```
-
-| Aspect | Assessment |
-|--------|------------|
-| Bandwidth | Low: download filter once, check many blobs locally |
-| Privacy | Good: server cannot determine which blobs client is verifying |
-| Integrity | None: confirms server claims to have the blob; does not verify content |
-| Implementation | Requires server support; filter format must be standardized |
-
-This approach can be combined with selective content verification: use filters for routine existence checks, then perform byte-range verification on a random sample or when filters indicate potential issues.
+For interoperable v0.1 deployments, verification MUST assume only the `HEAD`, `GET`, and optional `Range` behaviors described above.
 
 #### Hybrid Verification Strategy
 
 A practical deployment might combine approaches:
 
-1. **Daily**: Download server filters, check all shares exist in filters
-2. **Weekly**: Perform HEAD requests for any shares not covered by filters
-3. **Monthly**: Download and fully verify a random 1% sample of shares
-4. **On suspicion**: Fully verify any share that failed a lighter check
+1. **Daily or weekly**: Perform HEAD requests for all tracked shares
+2. **Monthly**: Download and fully verify a random 1% sample of shares
+3. **On suspicion**: Use byte-range or full-share verification for any share that failed a lighter check
 
 This balances bandwidth, privacy, and integrity while catching most failure modes.
 
@@ -1257,15 +1299,31 @@ When verification detects that share i of block b is unavailable or corrupted:
 
 9. **Commit**: Publish a new commit event with the updated root, referencing the previous commit.
 
-**Local file optimization**: If the client has the original file locally, steps 2-3 can be skipped entirely. Re-encrypt the local block with the same file key and block index (producing identical ciphertext), then re-encode to generate the missing share. This avoids downloading k shares over the network and is significantly faster.
+**Local file optimization**: If the client has the original file locally, steps 2-3 can be replaced with a full-block rewrite path. Re-encrypt the local block with the same file key and block index (with a fresh random nonce, producing different ciphertext), then re-encode to generate a completely new set of n shares. Because re-encryption changes the ciphertext and thus every share hash, the client MUST treat this as replacing the entire block version: all share IDs for that block change, all corresponding share descriptors must be rewritten, and any newly obsolete shares become garbage candidates. This optimization avoids downloading k shares over the network, but it is not equivalent to regenerating only the missing share from the recovered encrypted block.
 
 Repair from remote shares is expensive: it requires downloading k full shares (potentially hundreds of kilobytes each) and uploading at least one new share. However, repair occurs only on failure, and early detection prevents cascading failures that could make blocks unrecoverable.
 
-### 12.4 Steward Authority
+### 12.4 Verification and Authentication Mode Interaction
+
+Per-blob authentication keys (Section 11.2) prevent servers from correlating blobs to a single owner. However, this also prevents the server from enumerating "all blobs belonging to user X," which limits server-side verification capabilities. Identity-key servers can verify exhaustively but see all blobs.
+
+Users may designate servers into two tiers:
+
+**Identity-key servers**: Use the storage identity pubkey for authentication. These servers can enumerate all blobs for the user, enabling billing, quotas, and owner-level verification. The user sacrifices per-blob unlinkability on these servers.
+
+**Per-blob-key servers**: Use per-blob derived keys. These servers provide strong privacy (each blob appears to belong to a different user) but cannot perform owner-level verification.
+
+The protocol does not require any fixed number of identity-key servers. If a deployment uses them, clients SHOULD minimize their number and clearly warn that those servers can correlate uploads, repairs, and deletions for the associated storage identity.
+
+For per-blob-key servers, the client can perform random sampling verification: periodically download and verify 5-10% of shares stored on these servers. This catches corruption or data loss probabilistically without requiring the server to know which user the blobs belong to.
+
+### 12.5 Steward Authority
 
 Currently, a steward requires the full storage nsec to perform repairs. Both Blossom uploads (kind 24242 authorization) and commit events (kind 1097) require signatures from the storage keypair. There is no mechanism for delegated or restricted authority with current Nostr primitives.
 
 This means steward compromise is equivalent to full account compromise. Users must weigh the availability benefits of automated repair against the risk of key exposure. See Section 17.2 for discussion of potential protocol extensions enabling fine-grained delegation.
+
+Servers MUST default to `gc_capable = false` unless they are explicitly configured by the client as Garland-compatible delete targets. Clients MUST NOT attempt protocol-driven garbage collection against servers that are not known GC-capable. Servers using `auth: "none"` MUST be treated as append-only and non-GC unless the client has explicit, out-of-band knowledge that safe deletion is supported.
 
 ---
 
@@ -1277,54 +1335,102 @@ Content-addressed immutable storage naturally accumulates data. Updating a file 
 
 This design places garbage collection responsibility entirely with the client. The system does not automatically delete anything. Users must explicitly choose to delete obsolete data, accepting the tradeoff between storage costs and history preservation.
 
+Clients MUST persist the highest accepted `(seq, event_id)` locally after each successful sync. Clients SHOULD include this pair in the optional exported recovery checkpoint described in Section 10.2. Garbage collection MUST NOT run from a session that lacks either a previously accepted local head or a trusted imported checkpoint.
+
 ### 13.2 Reference Tracking
 
 The client maintains knowledge of which blobs are reachable from each commit. A blob is garbage if it's unreachable from any commit the user wishes to preserve.
 
-Computing reachability requires traversing the Merkle DAG from each preserved commit's root. The traversal must handle each blob type appropriately:
+Computing reachability requires traversing the Merkle DAG from each preserved commit's root. The traversal handles all blob types uniformly:
 
-**Directory blobs**: Extract `entries[i].hash` for each entry; these are content hashes of child inodes. Also collect the directory blob's own share IDs (from the parent's reference to it).
+**Inode references**: Each reference (in directory entries or commit content) is either `format: "single"` (has `hash`, `erasure`, and `shares`) or `format: "multi"` (has `inode_id`, `erasure`, and `blocks`). Collect all share IDs from the reference, then fetch and decrypt to traverse the inode's contents.
 
-**File inodes**: Extract `blocks[i].shares[j].id` for all shares of all blocks; these are the share hashes stored on servers. Also collect the inode blob's own share IDs. Note that the `blocks[i].hash` field is a plaintext integrity hash, not a server-stored blob.
+**File inodes**: Extract `blocks[i].shares[j].id` for all file content shares.
 
-**Large file inodes**: Extract `block_index_chunks[i].shares[j].id` for all indirect block shares, then traverse each indirect block to collect the actual content share IDs within.
-
-**Indirect block chunks**: Extract `blocks[i].shares[j].id` for all content shares referenced by this chunk.
+**Directory inodes**: For each entry, collect its inode reference shares, then recursively traverse the child inode.
 
 ```
 reachable_shares = {}
 
+def collect_inode_ref_shares(ref):
+    """Collect shares from a single-block or multi-block inode reference."""
+    if ref.format == "multi":
+        for block in ref.blocks:
+            for share in block.shares:
+                reachable_shares.add(share.id)
+    else:
+        for share in ref.shares:
+            reachable_shares.add(share.id)
+
 def traverse_from_commit(commit):
-    root_inode_shares = commit.root_inode.shares
-    for share in root_inode_shares:
-        reachable_shares.add(share.id)
-    traverse_inode(fetch_and_decrypt(root_inode_shares))
+    collect_inode_ref_shares(commit.root_inode)
+    root = fetch_and_decrypt(commit.root_inode)
+    traverse_inode(root)
 
 def traverse_inode(inode):
     if inode.type == "directory":
-        for entry in inode.entries:
-            for share in entry.shares:
-                reachable_shares.add(share.id)
-            child = fetch_and_decrypt(entry.shares)
+        for entry in inode.entries.values():
+            collect_inode_ref_shares(entry.ref)
+            child = fetch_and_decrypt(entry.ref)
             traverse_inode(child)
     elif inode.type == "file":
-        if inode.blocks:  # direct blocks
+        if inode.inline:
+            pass  # inline content lives inside the inode blob; no separate shares
+        else:
             for block in inode.blocks:
                 for share in block.shares:
                     reachable_shares.add(share.id)
-        if inode.block_index_chunks:  # large file indirect blocks
-            for chunk in inode.block_index_chunks:
-                for share in chunk.shares:
-                    reachable_shares.add(share.id)
-                indirect = fetch_and_decrypt(chunk.shares)
-                for block in indirect.blocks:
-                    for share in block.shares:
-                        reachable_shares.add(share.id)
 ```
 
 Shares not in `reachable_shares` are candidates for deletion. This includes old file content, old inodes, and old directory blobs from previous versions.
 
-### 13.3 Deletion Strategies
+### 13.3 Incremental Garbage Collection
+
+The `garbage` array in each commit (Section 9.1) lists shares that became newly unreachable relative to that commit's immediate parent. Each entry contains the share_id (SHA-256 of the share bytes), the server URL, and the auth mode needed to delete that share:
+
+```json
+"garbage": [
+    {"id": "<share_id>", "server": "https://blossom1.example.com", "auth": "blob"},
+    {"id": "<share_id>", "server": "https://blossom2.example.com", "auth": "identity"}
+]
+```
+
+Using share-level entries (rather than block-level hashes) avoids a chicken-and-egg problem: if garbage contained only block hashes, the client would need old inodes to resolve which share_ids to delete from which servers, but those old inodes may themselves be garbage. With share_ids and server URLs directly in the garbage array, each entry is a precise deletion candidate.
+
+The `garbage` array is an optimization hint, not the source of truth for safe deletion. Before deleting any share, clients MUST verify that the share is unreachable from every commit or snapshot the user intends to preserve. Clients MUST NOT run garbage collection while unresolved forks exist.
+
+This enables incremental collection with a safety check:
+
+```
+def incremental_gc(discarded_commits, preserved_commits, grace_period_seconds):
+    reachable = compute_reachable_shares(preserved_commits)
+    for commit in discarded_commits:
+        if now() - commit.created_at < grace_period_seconds:
+            continue
+        for entry in commit.garbage:
+            if entry.id not in reachable:
+                delete_share(entry.server, entry.id, entry.auth)
+```
+
+**Algorithm:**
+
+1. Decide which commits you will preserve
+2. Compute the reachable share set from that preserved set (Section 13.2)
+3. Build the list of discarded commits whose `garbage` arrays provide deletion candidates
+4. Wait a configurable grace period before deleting candidates; the default SHOULD be 30 days
+5. Delete only those candidate shares that are still absent from the preserved reachable set
+6. Optionally delete obsolete commit events from relays after blob GC completes
+
+This approach:
+- Uses the preserved reachable set as the safety-critical source of truth
+- Uses the `garbage` array to avoid re-deriving every deletion candidate from old state
+- Works incrementally as new commits are created
+- Provides a grace window for stale clients or delayed reconciliation
+- Keeps each garbage entry self-contained (share_id + server URL + auth mode)
+
+**Example**: To keep only the last 30 days of history, identify the commits to preserve, compute their reachable shares, then process garbage entries from older commits after the grace period. Delete only the entries absent from the preserved reachable set.
+
+### 13.4 Retention Strategies
 
 Several strategies for garbage collection exist, offering different tradeoffs:
 
@@ -1336,20 +1442,23 @@ Several strategies for garbage collection exist, offering different tradeoffs:
 
 **Explicit snapshots**: Mark specific commits as preserved (e.g., monthly snapshots, pre-migration backups). Delete blobs unreachable from any preserved commit.
 
-### 13.4 Deletion Process
+### 13.5 Deletion Process
 
-To delete a garbage blob, all n shares must be deleted from their respective servers. Partial deletion leaves the blob reconstructable from surviving shares.
+To fully delete obsolete data, all shares of the garbage blobs must be deleted from their respective servers. Partial deletion leaves the blob reconstructable from surviving shares.
 
-To delete garbage blobs:
+To delete garbage shares:
 
-1. Compute the set of blob hashes to delete
-2. For each blob, look up all n share locations from the inode
-3. For each share on each server:
-   - Generate a deletion authorization event
-   - Send DELETE request with authorization
-4. Publish a commit with the `garbage` field listing the deleted blob hashes
+1. Collect all share entries from the `garbage` arrays of the commits being cleaned up (each entry contains a share_id, server URL, and auth mode)
+2. For each share entry:
+   - Confirm that the share is unreachable from every preserved commit or snapshot
+   - Confirm that no unresolved fork exists and that the grace period has elapsed
+   - Select the deletion mode based on `entry.auth`: derive the per-blob auth key for `"blob"`, use the storage identity key for `"identity"`, or send no Authorization header for `"none"`
+   - Generate a deletion authorization event when `entry.auth` is `"blob"` or `"identity"`
+   - Send `DELETE /{share_id}` to the listed server using that mode
 
-The commit's `garbage` field serves as an announcement of intent. It signals to future clients examining history that these blobs were deliberately deleted and should not be considered missing or corrupted. Note that these hashes, while encrypted within the commit, could theoretically be correlated by an adversary who previously observed blob uploads, though this requires both passive observation of uploads and access to decrypted commits.
+If a server recorded as `auth: "none"` does not support unauthenticated deletion, clients MUST treat it as a non-GC target and plan retention accordingly.
+
+The commit's `garbage` field records when a share first became unreachable. It does not prove that deletion already happened. Clients examining history should treat a share listed in `garbage` as a deletion candidate, not an already-deleted object. The share_ids, while encrypted within the commit, could theoretically be correlated by an adversary who previously observed share uploads, though this requires both passive observation of uploads and access to decrypted commits.
 
 Deletion authorization uses the same Nostr event mechanism as uploads:
 
@@ -1361,22 +1470,16 @@ Deletion authorization uses the same Nostr event mechanism as uploads:
     ["x", "<sha256 of blob to delete>"],
     ["expiration", "1701910800"]
   ],
-  "content": "Garbage collection",
+  "content": "garland delete authorization",
   "sig": "<signature>"
 }
 ```
 
-### 13.5 Metadata Event Garbage Collection
+### 13.6 Metadata Event Retention
 
-The hash chain of commit events also accumulates over time. Old commit events may be pruned from relays to reduce storage, but this requires care.
+Garland v0.1 requires commit-chain continuity for interoperable recovery and head validation. Because every non-genesis commit validates against its parent, clients and relays MUST retain the full commit chain. Interior pruning is not part of the v0.1 interoperability surface.
 
-Safe deletion criteria for commit events:
-
-- The commit's blobs have been garbage collected (no point keeping metadata for deleted data)
-- The commit is not the chain head or a preserved snapshot
-- Sufficient time has passed that no client might be traversing through it
-
-In practice, commit events are small (kilobytes) and relay storage is cheap. Most users can retain their complete commit history indefinitely. Users with extremely long histories or storage-constrained relays can prune old commits, accepting that history before the pruning point becomes inaccessible.
+In practice, commit events are small (kilobytes) and relay storage is cheap. Most users can retain their complete commit history indefinitely. Future protocol versions may define checkpointing or re-anchoring mechanisms that permit safe pruning, but v0.1 does not.
 
 ---
 
@@ -1389,7 +1492,7 @@ This section provides the consolidated privacy analysis for security review. It 
 From any individual Blossom server's perspective:
 
 **Observable:**
-- Fixed-size encrypted blobs, all identical in size
+- Fixed-size encrypted shares, all identical in size for a given (B, k) configuration (share size = (B + pad) / k bytes, where pad accounts for RS alignment; see Section 5.2)
 - The SHA-256 hash of each blob (used as identifier)
 - A unique public key per blob (from per-blob authentication, see Section 11.2)
 - Timestamps of upload, access, and deletion requests
@@ -1416,19 +1519,20 @@ Relays storing commit events observe:
 **Observable:**
 - The public key publishing commits (owner identity or derived storage identity)
 - The `created_at` timestamp of each commit
-- The `prev` tag linking commits into a chain
 - The encrypted `content` field (opaque ciphertext)
 - The total number of commits over time
 - Timing patterns of commit activity
 
 **Not observable:**
-- The root hash or any blob references (encrypted in content)
+- The `prev` pointer linking commits (encrypted in content)
+- The root inode reference or any blob references (encrypted in content)
 - Commit messages (encrypted in content)
 - Garbage collection lists (encrypted in content)
 - What changed between commits
 - Dataset size or structure
+- How commits relate to each other (chain structure hidden)
 
-The `prev` tag reveals that commits form a chain but not what the chain contains. An observer can count commits and analyze timing but cannot determine whether a commit added one file or a thousand, or whether it deleted data via garbage collection.
+Observers can count commits and analyze timing but cannot determine whether a commit added one file or a thousand, whether it deleted data via garbage collection, or how commits link together.
 
 ### 14.3 Cross-Server Correlation
 
@@ -1457,6 +1561,7 @@ Even with correlation, the adversary learns only about activity patterns, not co
 | Storage identity | Relays only | Per-blob keys prevent server correlation |
 | Number of commits | Relays | Batch changes into fewer commits |
 | IP address | Servers and relays | Tor, VPN, proxy rotation |
+| Erasure coding parameter k | Cross-server observers (share size = B/k) | Negligible attack value; k is system-wide, not per-file; per-blob auth prevents linking to a user on a single server |
 
 With per-blob authentication keys, individual Blossom servers cannot determine per-user storage volume. Only colluding servers that combine timing analysis can attempt to correlate blobs, and even then, the link is probabilistic rather than cryptographic.
 
@@ -1485,13 +1590,13 @@ To add a file to the storage system:
 
 1. Read the file content
 2. Divide into fixed-size blocks with padding
-3. Generate a random per-file encryption key
+3. Generate a random file_id and derive the file encryption key
 4. For each block:
-   - Derive the block encryption key
-   - Encrypt with ChaCha20
+   - Derive block_key, then split into enc_key and mac_key (Section 6.2)
+   - Encrypt with ChaCha20 + HMAC-SHA256 using the split keys
    - Erasure-code into n shares
    - Upload shares to n servers
-5. Construct the inode with block metadata
+5. Construct the inode with file_id and block metadata
 6. Encrypt and upload the inode blob
 7. Update the parent directory to include the new entry
 8. Recursively update ancestors to the root
@@ -1501,8 +1606,8 @@ To add a file to the storage system:
 
 When the user saves:
 
-1. Fetch current chain head from relays
-2. Verify local changes are based on this head
+1. Fetch commit candidates from all configured relays
+2. Select the unique highest-seq valid head, or stop for reconciliation if the chain is forked
 3. Upload all staged blobs (files, inodes, directories)
 4. Construct commit event with new root and prev reference
 5. Sign and publish commit to relays
@@ -1512,8 +1617,8 @@ When the user saves:
 
 To read a file by path:
 
-1. Fetch current chain head
-2. Decrypt commit to obtain root blob location
+1. Fetch commit candidates from configured relays and select the unique valid head
+2. Decrypt commit to obtain the `root_inode` reference
 3. Traverse directory structure to target inode
 4. For each block in the inode:
    - Attempt to fetch k shares from listed servers
@@ -1528,8 +1633,8 @@ Periodically, the client should verify data availability:
 
 1. For each blob referenced by the current state:
    - For each share of that blob:
-     - Check existence via HEAD request, server fuse filters, or byte range request
-     - Optionally, download and verify full hash matches
+      - Check existence via HEAD request or byte range request
+      - Optionally, download and verify full hash matches
 2. If any blob has fewer than k available shares:
    - Fetch k surviving shares
    - Erasure-decode to recover the block
@@ -1547,7 +1652,7 @@ When storage costs warrant cleanup:
 3. Identify unreachable blobs
 4. Delete unreachable blobs from servers
 5. Optionally delete obsolete commit events from relays
-6. Record garbage collection in next commit
+6. Optionally record the maintenance action in a local GC log
 
 ---
 
@@ -1564,11 +1669,11 @@ Storage servers observe only uniformly-sized encrypted blobs. They cannot determ
 - Directory structure (directories are encrypted like files)
 - Relationships between blobs (no plaintext linking)
 
-The encryption is semantically secure: identical plaintexts produce different ciphertexts due to random per-file keys. Servers cannot detect when users store the same content.
+The encryption is semantically secure: identical plaintexts produce different ciphertexts due to random per-file keys and random nonces. Servers cannot detect when users store the same content.
 
 ### 16.2 Integrity
 
-Content addressing provides integrity at multiple levels. Share hashes verify individual share integrity. Block hashes (stored in inodes) verify decrypted block integrity. The Merkle DAG structure verifies structural integrity: any modification to any blob changes the root hash.
+Content addressing provides integrity at multiple levels. Share hashes verify individual share integrity. Block hashes (stored in inodes) verify decrypted block integrity. The Merkle DAG structure verifies structural integrity: any modification to any blob changes the root inode reference carried by later commits.
 
 Content addressing detects ciphertext tampering. If an attacker modifies stored data, the SHA-256 hash will not match the share ID, and the data will be rejected before decryption is attempted.
 
